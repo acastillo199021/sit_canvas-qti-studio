@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Canvas QTI Studio v3.11</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <div class="eyebrow">Canvas Classic Quizzes · QTI 1.2</div>
+      <div class="hero-title-row"><h1> IST - Canvas QTI Studio</h1><span class="version-tag">v3.11</span></div>
+      <p class="hero-copy">Convert Word assessments to Canvas question banks — configure, validate, then review the questions that matter.</p>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <nav class="main-tabs" aria-label="Workspace views">
+      <button class="main-tab active" type="button" data-view="setup" aria-selected="true"><span class="main-tab-number">01</span> Setup &amp; Validation</button>
+      <button class="main-tab" type="button" data-view="review" aria-selected="false"><span class="main-tab-number">02</span> Question Review <span id="reviewTabCount" class="nav-count">0</span></button>
+    </nav>
+
+    <section id="setupView" class="main-view active" aria-label="Setup and validation">
+      <div class="setup-layout">
+        <section class="card compact-card setup-card">
+          <div class="card-head">
+            <div><div class="section-kicker">STEP 1 · INPUT</div><h2>Upload assessment</h2></div>
+            <span class="pill neutral">Word .docx</span>
+          </div>
+          <label id="dropzone" class="dropzone" for="fileInput">
+            <div class="drop-icon">⇪</div>
+            <div class="drop-copy"><strong>Choose or drop Word files</strong><span>Select one or more .docx assessments to analyze.</span></div>
+            <span class="browse-affordance">Browse files</span>
+          </label>
+          <input id="fileInput" type="file" accept=".docx" multiple hidden>
+          <div id="fileTray" class="file-tray"></div>
+          <div class="section-rule"></div>
+          <div class="card-head"><div><div class="section-kicker">STEP 2 · OPTIONS</div><h2>Export settings</h2></div></div>
+          <div class="config-grid">
+            <label class="field"><span>Default points / question</span><input id="defaultPoints" type="number" min="0.01" step="0.01" value="1"></label>
+            <label class="field"><span>Questions per group <em>(optional)</em></span><input id="questionsPerSet" type="number" min="1" step="1" placeholder="Auto-detect"></label>
+            <label class="field field-wide"><span>Package format</span><select id="outputMode"><option value="combined">One combined QTI ZIP</option><option value="individual">A bundle of individual bank ZIPs</option></select></label>
+          </div>
+          <div class="toggle-list option-toggles">
+            <label class="toggle"><input id="includeHeading" type="checkbox" checked><span>Add group title to the question stem</span></label>
+            <label class="toggle"><input id="excludeReferences" type="checkbox" checked><span>Exclude references</span></label>
+            <label class="toggle"><input id="shuffleAnswers" type="checkbox" checked><span>Shuffle answer choices</span></label>
+          </div>
+          <div class="section-rule"></div>
+          <div class="actions-bar">
+            <button id="analyzeBtn" type="button" class="btn btn-primary" disabled>Analyze files</button>
+            <button id="validateBtn" type="button" class="btn btn-secondary" disabled>Run validation</button>
+            <button id="exportBtn" type="button" class="btn btn-accent" disabled>Export QTI</button>
+          </div>
+          <div id="statusBanner" class="status-banner info" role="status">Upload one or more Word files to begin.</div>
+        </section>
+        <aside class="card summary-panel">
+          <div class="card-head"><div><div class="section-kicker">STEP 3 · RESULTS</div><h2>Validation overview</h2></div><span id="validationState" class="pill neutral">Not analyzed</span></div>
+          <div class="headline-stats"><div><strong id="setupBankCount">0</strong><small>Banks</small></div><div><strong id="setupQuestionCount">0</strong><small>Questions</small></div><div><strong id="setupPointCount">0</strong><small>Total points</small></div></div>
+          <div class="summary-breakdown">
+            <div><span class="status-dot good-dot"></span><span>Good</span><strong id="setupGood">0</strong></div>
+            <div><span class="status-dot review-dot"></span><span>Needs Review</span><strong id="setupReview">0</strong></div>
+            <div><span class="status-dot correction-dot"></span><span>Needs Correction</span><strong id="setupCorrection">0</strong></div>
+          </div>
+          <div id="setupValidationMessage" class="validation-overview-note">Upload a Word file and select <strong>Analyze files</strong> to see the results.</div>
+          <button id="goReviewBtn" type="button" class="btn btn-primary full-button" disabled>Open Question Review <span aria-hidden="true">→</span></button>
+          <button id="downloadReportBtn" type="button" class="btn btn-quiet full-button" disabled>Download validation JSON</button>
+          <div class="summary-helper"><strong>Workflow</strong><p>Analyze your source, review flagged questions on the next tab, validate changes, and export your QTI package.</p></div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="reviewView" class="main-view" aria-label="Question review" hidden>
+      <div class="card review-toolbar">
+        <div class="review-toolbar-head">
+          <div><div class="section-kicker">QUESTION WORKSPACE</div><h2>Review questions</h2><p>Find a question, filter by type or status, then edit or preview it.</p></div>
+          <div class="review-top-actions">
+            <span id="resultCount" class="pill neutral">0 matching</span>
+            <button id="reviewValidateBtn" class="btn btn-secondary" type="button" disabled>Run validation</button>
+            <button id="reviewExportBtn" class="btn btn-accent" type="button" disabled>Export QTI</button>
+          </div>
+        </div>
+        <div class="review-filters">
+          <label class="field search-field"><span>Search question or bank</span><input id="searchBox" type="search" placeholder="Search title, text, answer, or group..."></label>
+          <label class="field"><span>Question type</span><select id="questionTypeFilter">
+            <option value="all">All question types</option>
+            <option value="multiple_choice">Multiple Choice</option>
+            <option value="multiple_answers">Multiple Answers</option>
+            <option value="multiple_choice_images">Multiple Choice with Images</option>
+            <option value="matching">Matching</option>
+            <option value="multiple_dropdowns">Multiple Dropdowns</option>
+            <option value="true_false">True / False</option>
+          </select></label>
+          <button id="clearFiltersBtn" class="btn btn-quiet clear-filters" type="button">Clear filters</button>
+        </div>
+        <div id="reviewExportNotice" class="review-export-notice" role="status">Analyze questions and run validation before exporting.</div>
+      </div>
+
+      <div class="summary-grid">
+        <button class="summary-card filter-card all active" type="button" data-filter="all"><small>All</small><strong id="countAll">0</strong><span>Questions</span></button>
+        <button class="summary-card filter-card good" type="button" data-filter="good"><small>Good</small><strong id="countGood">0</strong><span>Ready</span></button>
+        <button class="summary-card filter-card review" type="button" data-filter="review"><small>Needs Review</small><strong id="countReview">0</strong><span>Check details</span></button>
+        <button class="summary-card filter-card correction" type="button" data-filter="correction"><small>Needs Correction</small><strong id="countCorrection">0</strong><span>Fix required</span></button>
+      </div>
+
+      <div class="workspace">
+        <aside class="card sidebar">
+          <div class="card-head"><div><div class="section-kicker">STEP 2</div><h2>Question banks</h2></div><span id="bankCountPill" class="pill neutral">0 banks</span></div>
+          <div class="issue-filter-heading"><span class="issue-filter-caption">Quick issue filters</span><button type="button" class="issue-clear-filters" aria-label="Clear all question filters">Clear Filters</button></div>
+          <div id="bankIssueFilters" class="issue-filter-bar" aria-label="Filter question banks by issue"></div>
+          <label class="issue-feedback-label">Feedback <select class="feedback-filter" aria-label="Filter by feedback"><option value="all">All feedback</option><option value="no_feedback">No Feedback (optional)</option></select></label>
+          <div id="bankList" class="bank-list empty-state">No banks analyzed yet.</div>
+        </aside>
+        <section class="card center-panel">
+          <div class="card-head"><div><div class="section-kicker">STEP 3</div><h2>Questions</h2><p class="question-selection-hint">Select, add, duplicate, or reorder questions.</p></div><div class="question-head-actions"><span id="currentFilterLabel" class="pill neutral">All</span><button id="addQuestionBtn" type="button" class="btn btn-primary btn-small">+ Add question</button></div></div>
+          <div class="issue-filter-heading"><span class="issue-filter-caption">Quick issue filters</span><button type="button" class="issue-clear-filters" aria-label="Clear all question filters">Clear Filters</button></div>
+          <div id="questionIssueFilters" class="issue-filter-bar" aria-label="Filter questions by issue"></div>
+          <label class="issue-feedback-label">Feedback <select class="feedback-filter" aria-label="Filter by feedback"><option value="all">All feedback</option><option value="no_feedback">No Feedback (optional)</option></select></label>
+          <div id="questionList" class="question-list empty-state">Analyze your Word file to review questions.</div>
+        </section>
+        <section class="card inspector">
+          <div class="card-head"><div><div class="section-kicker">STEP 4</div><h2>Editor &amp; preview</h2></div><button id="expandEditorBtn" type="button" class="btn btn-quiet btn-small" aria-pressed="false">Expand editor</button></div>
+          <div class="inspector-tabs" role="tablist" aria-label="Question tools">
+            <button class="tab active" type="button" data-tab="editor">Editor</button>
+            <button class="tab" type="button" data-tab="preview">Preview</button>
+            <button class="tab" type="button" data-tab="validation">Validation</button>
+          </div>
+          <div class="inspector-body">
+            <div id="editorTab" class="tab-panel active"><div id="editorPanel" class="editor-placeholder">Select a question to edit it.</div></div>
+            <div id="previewTab" class="tab-panel"><div id="previewPanel" class="preview-placeholder">Select a question to preview it.</div></div>
+            <div id="validationTab" class="tab-panel"><div id="validationPanel" class="validation-placeholder">Run validation to view a concise summary and actionable issues.</div></div>
+          </div>
+        </section>
+      </div>
+    </section>
+    <footer class="app-footer">Your Word files are processed locally in the browser. Mammoth and JSZip are loaded from CDN and require an internet connection.</footer>
+  </main>
+</body>
+</html>
