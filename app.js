@@ -12,6 +12,8 @@ const state = {
   issueFilter: "all",
   feedbackFilter: "all",
   importWarnings: [],
+  sourcePointRules: {},
+  defaultPointsUserEdited: false,
   editorExpanded: false,
   idSequence: 0
 };
@@ -61,6 +63,7 @@ const dom = {
   currentFilterLabel: document.getElementById("currentFilterLabel"),
   addQuestionBtn: document.getElementById("addQuestionBtn"),
   expandEditorBtn: document.getElementById("expandEditorBtn"),
+  nextQuestionBtn: document.getElementById("nextQuestionBtn"),
   issueFilterBars: [...document.querySelectorAll(".issue-filter-bar")]
 };
 
@@ -163,6 +166,14 @@ const hasQuestionImage = question => {
   const source = [question.stem || "", ...(question.choices || []).map(choice => choice.html || "")].join(" ");
   return /<img\b/i.test(source) || /https:\/\/cdn-media\.[^\s<>"']+\.(?:png|jpe?g|gif|webp)(?:\?|\b)/i.test(source);
 };
+function unresolvedQuestionImageReference(question,group){
+  // Sentences that explicitly refer to a picture/diagram are actionable
+  // even when the author forgot to embed an image in Word.
+  const text=textFromHtml(question.stem||"");
+  const refersToVisual=/\b(?:picture\s+below|image\s+(?:above|below)|in\s+the\s+image|in\s+this\s+image|glands\s+in\s+the\s+image|in\s+the\s+diagram|in\s+the\s+figure)\b/i.test(text);
+  return refersToVisual && !hasQuestionImage(question) &&
+    !canonicalCdnImageUrl(group?.imageUrl||"");
+}
 const questionCategory = question => {
   if (question.type === "multiple_dropdowns_question") return "multiple_dropdowns";
   if (question.type === "matching_question") return "matching";
@@ -253,6 +264,7 @@ dom.exportBtn.addEventListener("click", exportQti);
 dom.reviewValidateBtn.addEventListener("click", runValidation);
 dom.reviewExportBtn.addEventListener("click", exportQti);
 
+dom.defaultPoints.addEventListener("input",()=>{state.defaultPointsUserEdited=true;});
 [dom.defaultPoints, dom.questionsPerSet, dom.includeHeading, dom.excludeReferences, dom.shuffleAnswers, dom.outputMode].forEach(el => {
   el.addEventListener("change", () => {
     if (state.groups.length) {
@@ -324,7 +336,9 @@ async function analyzeFiles() {
     setStatus("Reading Word file(s) and detecting banks...", "info");
     state.groups = [];
     state.importWarnings = [];
+    state.sourcePointRules = {};
     let allGroups = [];
+    const observedSourcePoints = [];
     for (let i = 0; i < state.files.length; i += 1) {
       const file = state.files[i];
       const arrayBuffer = await file.arrayBuffer();
@@ -335,10 +349,23 @@ async function analyzeFiles() {
           "i => em"
         ]
       });
+      const sourceRule = detectSourcePointsRule(result.value);
+      if (sourceRule != null) {
+        state.sourcePointRules[file.name] = sourceRule;
+        observedSourcePoints.push(sourceRule);
+      }
       const fileGroups = parseHtmlToGroups(result.value, file.name);
+      fileGroups.forEach(g=>g.sourcePointsPerQuestion=sourceRule);
       allGroups = allGroups.concat(fileGroups);
     }
     state.groups = allGroups;
+    // A uniform source-level rule overrides the initial UI default, but remains
+    // fully editable. A mismatch introduced later is flagged during validation.
+    if (observedSourcePoints.length && observedSourcePoints.length===state.files.length &&
+        observedSourcePoints.every(n=>n===observedSourcePoints[0]) &&
+        Number(dom.defaultPoints.value)===1 && !state.defaultPointsUserEdited && !state.groups.some(g=>g.questions.some(q=>q.points!==""&&q.points!=null))) {
+      dom.defaultPoints.value=String(observedSourcePoints[0]);
+    }
     revalidateAll();
     state.selectedBankId = state.groups[0]?.id || null;
     state.selectedQuestionId = state.groups[0]?.questions[0]?.id || null;
@@ -485,12 +512,20 @@ function qtiSourceEvents(html) {
   const push=(html,kind="text",meta={})=>{
     // Preserve underscores here: they encode numbered dropdown blanks in Word.
     // They are cleaned only after the question type has been identified.
+    html=String(html).replace(/\[\s*MD\d+\s*\]/gi,"");
     const text=String(textFromHtml(html)).replace(/\s+/g," ").trim();
+    if(/^\s*(?:Need Mei to confirm where the minus|start here\s*$)/i.test(text))return;
     if(text) events.push({html,text,kind,...meta});
   };
   for(const el of [...doc.body.children]){
     const tag=el.tagName.toLowerCase();
     if(tag==="table") {events.push({html:el.outerHTML,text:normalizeSpaces(el.textContent),kind:"table",element:el});continue;}
+    // Some Word converters wrap several answer paragraphs in a blockquote.
+    // Treat each inner paragraph as its own choice, preserving rich formatting.
+    if(tag==="blockquote" && el.querySelectorAll("p").length>1){
+      for(const child of el.querySelectorAll("p"))push(blockInnerHtml(child));
+      continue;
+    }
     if(tag==="ul"||tag==="ol") {
       const listStyle=(el.getAttribute("style")||"").toLowerCase();
       const letter=tag==="ol" && (/^[aA]$/.test(el.getAttribute("type")||"") || /list-style-type\s*:\s*(?:lower-alpha|upper-alpha|lower-latin|upper-latin)/.test(listStyle));
@@ -507,7 +542,7 @@ function qtiSourceEvents(html) {
             if(numbering && !/^\d+\s*[.)]/.test(normalizeSpaces(textFromHtml(frag))))
               frag=`${i}. ${frag}`;
           }
-          push(frag,letter?"letter-list":numbering?"numbered-list":"bullet",{listIndex:i});
+          push(frag,letter?"letter-list":numbering?"numbered-list":"bullet",{listIndex:i,automaticNumbering:numbering,automaticLettering:letter});
         });
       }
       continue;
@@ -517,18 +552,32 @@ function qtiSourceEvents(html) {
   }
   return events;
 }
+function stripLeadingTextPrefix(html,prefixRx){
+  const doc=new DOMParser().parseFromString(`<div id="qti-strip-prefix">${html}</div>`,"text/html");
+  const root=doc.getElementById("qti-strip-prefix");
+  const match=(root.textContent||"").match(prefixRx);
+  if(!match)return String(html||"");
+  let remaining=match[0].length;
+  const walker=doc.createTreeWalker(root,4),nodes=[];
+  while(walker.nextNode())nodes.push(walker.currentNode);
+  for(const node of nodes){if(!remaining)break;
+    const amount=Math.min(remaining,(node.nodeValue||"").length);
+    node.nodeValue=node.nodeValue.slice(amount);remaining-=amount;
+  }
+  return root.innerHTML.trim();
+}
 function qtiCleanLine(value){return normalizeSpaces(textFromHtml(value));}
 function qtiQuestionStemCandidate(text){
-  const value=String(text||"").replace(/^\s*\d+\s*[.)]\s*/,"").trim();
+  const value=String(text||"").replace(/^\s*\d+\s*[.),]\s*/,"").trim();
   return /^(?:match\b|select\b|place\b|using\b|which\b|what\b|how\b|identify\b|choose\b|complete\b|the client\b|a client\b|two clients\b|several clients\b|each of these\b|in the following\b)/i.test(value)
     || (/\?/.test(value) && /(?:client|medical|symptoms|substance|term|condition|structure|signs)/i.test(value));
 }
 function qtiNumberedValue(text) {
-  const m=String(text||"").match(/^\s*(\d+)\s*[.)]\s*(.+)$/s);
+  const m=String(text||"").match(/^\s*(\d+)\s*[.),]\s*(.+)$/s);
   return m ? {index:Number(m[1]),value:m[2].trim()} : null;
 }
 function qtiStripQuestionNumber(html) {
-  return String(html||"").replace(/^\s*\d+\s*[.)]\s*/,"").trim();
+  return String(html||"").replace(/^\s*\d+\s*[.),]\s*/,"").trim();
 }
 function qtiLetterTokens(text){
   // This is intentionally run on text, not raw HTML. It recognizes letters
@@ -746,6 +795,221 @@ function qtiNewQuestion(bank,serial,stem){
     type:"multiple_choice_question",feedback:"",points:"",itemTitle:"",status:"good",issues:[],
     parseIssues:[],sourceEvents:[]};
 }
+// v3.13: Matching grids are ordered sets of *prompts* and a shuffled
+// teacher option pool. A Word table's horizontal row is NOT automatically a
+// correct match (e.g. 1. Aden/o | A. Pancreas has the key 1-E).
+function qtiParseShuffledMatchingTables(records, matchingTables, issue) {
+  const rows=matchingTables.flat();
+  const numbered=rows.map(row=>({row,item:qtiNumberedValue(row.left)})).filter(x=>x.item);
+  if(!numbered.length)return null; // Keep the tested legacy table parsers.
+  const keyAt=records.findIndex(e=>isAnswerKeyEvent(e.text));
+  const keyRecords=keyAt<0?[]:records.slice(keyAt);
+  const keys=qtiParseKey(keyRecords.map(e=>e.text).join(" "));
+  const byLetter=new Map();
+  for(const row of rows){
+    const label=extractLetter(row.right);
+    if(!label)continue;
+    const text=stripOptionLabel(row.right);
+    if(byLetter.has(label) && byLetter.get(label)!==text)issue(`Conflicting option ${label} in Matching table.`);
+    byLetter.set(label,text);
+  }
+  const pairs=[];let sourceKey="";
+  if(keys.length && byLetter.size){
+    sourceKey="lettered";
+    const keyByNum=new Map();
+    for(const key of keys){
+      if(keyByNum.has(key.number))issue(`Duplicate Matching key for row ${key.number}.`);
+      keyByNum.set(key.number,key.letter);
+    }
+    for(const {item} of numbered){
+      const answer=keyByNum.get(item.index);
+      if(!answer || !byLetter.has(answer))issue(`Matching row ${item.index} cannot be resolved from the answer key.`);
+      pairs.push({left:item.value,right:byLetter.get(answer)||""});
+    }
+    for(const key of keyByNum.keys())if(!numbered.some(x=>x.item.index===key))issue(`Answer key ${key} references missing Matching row.`);
+    if(keys.length!==numbered.length)issue("Matching key count does not match source table rows.");
+  } else if(keyAt>=0){
+    // The right column may contain only underscore placeholders. In this
+    // format the ordered Correct Answers list supplies the right values.
+    const entries=[];
+    for(const event of keyRecords){
+      const raw=event.text.replace(/^\s*Correct\s+(?:Answers?|Matches?)\s*:\s*/i,"");
+      const found=qtiNumberedValue(raw);
+      if(found)entries.push(found);
+      else for(const m of raw.matchAll(/(?:^|\s)(\d+)\s*[.)]\s+(.+?)(?=\s+\d+\s*[.)]\s+|$)/g))
+        if(m[2].trim())entries.push({index:Number(m[1]),value:m[2].trim()});
+    }
+    if(entries.length){
+      sourceKey="ordered";
+      const byNumber=new Map(entries.map(e=>[e.index,e.value]));
+      for(const {item} of numbered){
+        if(!byNumber.has(item.index))issue(`Missing ordered answer for Matching row ${item.index}.`);
+        pairs.push({left:item.value,right:byNumber.get(item.index)||""});
+      }
+      if(entries.length!==numbered.length)issue("Ordered answers do not match Matching row count.");
+    }
+  }
+  if(!sourceKey){
+    // Preserve the existing direct-pair support, but DO NOT misinterpret
+    // shuffled lettered choices as aligned pairs in the absence of a key.
+    if(byLetter.size){
+      for(const {item} of numbered)pairs.push({left:item.value,right:""});
+      issue("The Matching table contains lettered choices but no verifiable answer key.");
+    }else{
+      for(const {row,item} of numbered)pairs.push({left:item.value,right:row.right});
+      if(pairs.some(p=>!p.right))issue("The Matching table contains blank answers without a resolvable key.");
+      else issue("Confirm direct Matching table associations; no explicit key was found.","review");
+    }
+  }
+  if(!pairs.length)issue("Matching table has no numbered source descriptions.");
+  return {pairs,distractors:[...byLetter].filter(([letter])=>!keys.some(k=>k.letter===letter)).map(([,value])=>value),sourceKey};
+}
+
+// v3.13 PARSER-046/047: A Word term-building item can have 2, 4 or 6
+// independently graded blanks, shared answer pools, and a teacher-only key.
+// This conversion is deliberately separate from legacy numbered / bracketed
+// dropdowns and does NOT change old Matching/MC detection.
+function qtiNumberedPoolTokens(value){
+  const src=String(value||"").replace(/\u00a0/g," ")
+    .replace(/\s+\+\s+(?=\d+\s*[.)])/g," ");
+  const rx=/(?:^|\s)(\d{1,2})\s*[.)]\s*/g;
+  const positions=[...src.matchAll(rx)];
+  return positions.map((m,i)=>({number:Number(m[1]),text:src.slice(m.index+m[0].length,i+1<positions.length?positions[i+1].index:src.length).trim().replace(/\s*\+\s*$/,'')}))
+    .filter(x=>x.text && !/^_{3,}$/.test(x.text));
+}
+function qtiWordPartKey(text){
+  const list=[];
+  const s=String(text||"").replace(/\u00a0/g," ");
+  const rx=/([A-F])\s*[.)]\s*(?:-\s*)?(?:(\d{1,2})\s*(?:[.)]\s*|(?=\S)))?([\s\S]*?)(?=\s*\+\s*[A-F]\s*[.)]|\s+[A-F]\s*[.)]\s*(?:-?\d+\s*[.)])|$)/gi;
+  for(const m of s.matchAll(rx)){
+    const value=m[3].trim().replace(/^[+\s]+|[+\s]+$/g,"");
+    if(value)list.push({label:m[1].toUpperCase(),number:m[2]?Number(m[2]):null,text:value});
+  }
+  return list;
+}
+function qtiSourceBlankLabels(str){
+  return [...String(str||"").matchAll(/\b([A-F])\s*[.)]\s*_{2,}/gi)].map(m=>m[1].toUpperCase());
+}
+function qtiNormalizeMedicalValue(s){
+  return normalizeSpaces(String(s||"").replace(/^[-–]\s*(?=\d)/,""))
+    .replace(/^\d+\s*[.)]\s*/,"")
+    .replace(/\([^)]*\)/g,"").replace(/^[\s-]+|[\s-]+$/g,"")
+    .replace(/\s+/g,"").toLowerCase();
+}
+function qtiParseWordPartDropdowns(q,records,addIssue){
+  const all=[q.stem,...records.map(e=>e.text)].join("\n");
+  const hasPools=/\bOptions\s+(?:for|of)\s+[A-F]\s*[,/]\s*[A-F]\b/i.test(all);
+  const hasInlinePool=/\bOptions\s*:\s*1\s*[.)]/i.test(all);
+  const labels=qtiSourceBlankLabels(all);
+  if((!hasPools&&!hasInlinePool)||labels.length<2)return false;
+  const combinedRecords=/\bOptions\s*:/i.test(q.stem) && !records.some(e=>/\bOptions\s*:/i.test(e.text))
+    ? [{text:textFromHtml(q.stem),html:q.stem,kind:"text"},...records] : records;
+  const firstPool=combinedRecords.findIndex(e=>/\bOptions\s*(?:for|of)\s+[A-F]\s*[,/]\s*[A-F]|\bOptions\s*:\s*1\s*[.)]/i.test(e.text));
+  if(firstPool<0)return false;
+  const keyIndex=combinedRecords.findIndex(e=>/^\s*Correct\s+Answers?\s*:/i.test(e.text));
+  const body=combinedRecords.slice(0,firstPool);
+  const keys=combinedRecords.slice(keyIndex>=0?keyIndex:combinedRecords.length);
+  const keyParts=[];
+  for(const entry of keys){
+    const raw=entry.text.replace(/^\s*Correct\s+Answers?\s*:\s*/i,"");
+    if(!raw)continue;
+    keyParts.push(...qtiWordPartKey(raw));
+  }
+  const pools=[];
+  let active=null;
+  function ensurePool(header){
+    const rx=/\bOptions\s*(?:for|of)\s+([A-F](?:\s*[,/]\s*[A-F]){0,5})\s*:?(.*)$/i;
+    const m=header.match(rx);
+    if(m){active={labels:m[1].toUpperCase().split(/\s*[,/]\s*/),options:[]};pools.push(active);return m[2].trim();}
+    if(/\bOptions\s*:\s*1\s*[.)]/i.test(header)){
+      active={labels:[],options:[]};pools.push(active);
+      return header.replace(/^.*?\bOptions\s*:\s*/i,"").trim();
+    }
+    return null;
+  }
+  for(const entry of combinedRecords.slice(firstPool,keyIndex>=0?keyIndex:undefined)){
+    const t=entry.text;
+    let rest=ensurePool(t);
+    if(rest===null)rest=t;
+    if(!active)continue;
+    const found=qtiNumberedPoolTokens(rest);
+    for(const option of found){
+      const older=active.options.find(o=>o.number===option.number);
+      if(older && older.text!==option.text)addIssue(`Conflicting word-part option ${option.number}.`);
+      else if(!older)active.options.push(option);
+    }
+  }
+  if(hasInlinePool && pools.length===1 && !pools[0].labels.length){
+    // Word often prints 1..7 combining forms + 8..12 suffixes on a single
+    // paragraph. Preserve the numbering as the authoritative partition.
+    const allOptions=pools[0].options;
+    const split=allOptions.findIndex(o=>/^[-–]/.test(o.text) && o.number>=8);
+    const cut=split>=0?split:allOptions.findIndex(o=>o.number>=8);
+    if(cut<1)addIssue("Could not distinguish combining forms and suffix choices.");
+    pools.splice(0,1,
+      {labels:["A","C","E"],options:cut>0?allOptions.slice(0,cut):allOptions},
+      {labels:["B","D","F"],options:cut>0?allOptions.slice(cut):[]});
+  }
+  const uniqueLabels=[...new Set(labels)];
+  q.type="multiple_dropdowns_question";q.dropdownMode="lettered-word-parts";
+  // Some Word items (e.g., Sense Term Building Q3) begin directly with
+  // a description rather than a `Select...` direction. The numbered opening
+  // is already in q.stem, so convert its blanks as well as later body lines.
+  const opening=String(q.stem||"").replace(/\b([A-F])\s*[.)]\s*_{2,}/gi,
+    (_,letter)=>`${letter}. [blank${letter.toUpperCase().charCodeAt(0)-64}]`);
+  q.stem=/<p\b/i.test(opening)?opening:`<p>${opening}</p>`;
+  // Retain the original rich text and sentence breaks; do not show the
+  // instructor option lists or Correct Answers in the student-facing stem.
+  for(const e of body){
+    const visible=String(e.html||esc(e.text)).replace(/\b([A-F])\s*[.)]\s*_{2,}/gi,(_,letter)=>`${letter}. [blank${letter.charCodeAt(0)-64}]`);
+    q.stem+=`<p>${visible}</p>`;
+  }
+  q.blanks=[];
+  for(const letter of uniqueLabels){
+    const pool=pools.find(x=>x.labels.includes(letter)) || pools.find(x=>!x.labels.length) || null;
+    const key=keyParts.find(k=>k.label===letter);
+    if(!pool){addIssue(`Missing option pool for blank ${letter}.`);continue;}
+    if(!key)addIssue(`Missing correct answer for blank ${letter}.`);
+    const matchedByNumber=key?.number!=null?pool.options.find(o=>o.number===key.number):null;
+    const matchedByText=!matchedByNumber && key?pool.options.filter(o=>qtiNormalizeMedicalValue(o.text)===qtiNormalizeMedicalValue(key.text)):[];
+    const selected=matchedByNumber || (matchedByText.length===1?matchedByText[0]:null);
+    if(key && !selected)addIssue(`Correct answer for blank ${letter} (${key.text}) is not one of the available options.`);
+    if(key && matchedByNumber && qtiNormalizeMedicalValue(matchedByNumber.text)!==qtiNormalizeMedicalValue(key.text))
+      addIssue(`Answer ${letter} references option ${key.number}, but its spelling differs from the key. Confirm the word part.`,"review");
+    q.blanks.push(qtiBlankModel(`blank${letter.charCodeAt(0)-64}`,`Option ${letter.charCodeAt(0)-64}`,
+      pool.options.map(o=>({text:o.text,correct:!!selected&&o.number===selected.number}))));
+    if(pool.options.length<2)addIssue(`Blank ${letter} has fewer than two answer choices.`);
+  }
+  if(q.blanks.length!==uniqueLabels.length)addIssue("Some lettered dropdowns were not extracted.");
+  if(keyParts.length!==uniqueLabels.length)addIssue("Correct Answers do not cover all dropdowns.");
+  return true;
+}
+function qtiParseOrderedAnswerDropdowns(q,records,addIssue){
+  if(records.some(e=>e.kind==="table"))return false;
+  const answerAt=records.findIndex(e=>/^\s*Correct\s+Answers?\s*:/i.test(e.text));
+  if(answerAt<0)return false;
+  const pre=records.slice(0,answerAt);
+  const numbered=pre.map(e=>({e,row:qtiNumberedValue(e.text)})).filter(x=>x.row&&/_{3,}/.test(x.row.value));
+  if(numbered.length<2)return false;
+  const after=records.slice(answerAt+1);
+  const answers=after.map(e=>qtiNumberedValue(e.text)).filter(Boolean);
+  if(!answers.length)return false;
+  q.type="multiple_dropdowns_question";q.dropdownMode="ordered-answers";
+  q.stem=`<p>${q.stem}</p>`;
+  const answerByNumber=new Map(answers.map(a=>[a.index,a.value]));
+  const pool=[...new Set(answers.map(a=>a.value))];
+  q.blanks=[];
+  for(const {e,row} of numbered){
+    const id=`blank${row.index}`;
+    q.stem+=`<p>${e.html.replace(/_{3,}/g,`[${id}]`)}</p>`;
+    const answer=answerByNumber.get(row.index);
+    if(!answer)addIssue(`Missing correct answer for dropdown ${row.index}.`);
+    q.blanks.push(qtiBlankModel(id,`Option ${row.index}`,pool.map(v=>({text:v,correct:v===answer}))));
+  }
+  if(numbered.length!==answers.length)addIssue("Ordered answers do not match the number of blanks.");
+  return true;
+}
+
 function qtiCompileQuestion(q,body,bank){
   const texts=body.map(e=>e.text);
   const all=texts.join("\n");
@@ -789,8 +1053,24 @@ function qtiCompileQuestion(q,body,bank){
     return;
   }
 
-  // 2. Table Matching, including fragments split across Word pages/tables.
-  // Only answer-key-backed rows become pairs when coded options are shuffled.
+  // Endocrine hormones / word-parts require real select controls, never MC.
+  if(qtiParseWordPartDropdowns(q,records,addIssue))return;
+  if(qtiParseOrderedAnswerDropdowns(q,records,addIssue))return;
+
+  // 2. Word tables with numbered descriptions, including shuffled answer
+  // columns or blank answer cells resolved by a teacher's ordered key.
+  if(tableEvents.length){
+    const structured=qtiParseShuffledMatchingTables(records,matchingTables,(message,level)=>addIssue(message,level));
+    if(structured){
+      q.type="matching_question";q.pairs=structured.pairs;
+      q.distractors=structured.distractors;
+      q.matchingNotes=[];
+      q.matchingKeySource=structured.sourceKey;
+      return;
+    }
+  }
+
+  // Legacy direct-pair and arrow-key Matching remains unchanged.
   if(tableEvents.length){
     q.type="matching_question";
     const rows=matchingTables.flat();
@@ -964,7 +1244,7 @@ function qtiCompileQuestion(q,body,bank){
       const num=Number(id.replace("blank",""));
       const target=key.get(num);
       if(!target)addIssue(`Correct Matches is missing blank ${num}.`);
-      q.blanks.push(qtiBlankModel(id,`Blank ${num}`,choices.map(o=>({text:o.text,correct:o.label===target}))));
+      q.blanks.push(qtiBlankModel(id,`Option ${q.blanks.length+1}`,choices.map(o=>({text:o.text,correct:o.label===target}))));
     }
     if(!q.blanks.length)addIssue("Numbered dropdown blanks were not found.");
     if(choices.length<2)addIssue("Shared options were not recognized for dropdown blanks.");
@@ -1005,11 +1285,15 @@ function qtiCompileQuestion(q,body,bank){
       if(content)q.feedback=[q.feedback,esc(content)].filter(Boolean).join("<br>");
       continue;
     }
-    const choices=qtiLetterTokens(row.text);
-    const startsWithChoice=/^\s*\*?\s*[A-H][.)]/i.test(row.text);
+    // Each Word answer paragraph is ONE choice. An answer such as "E. coli"
+    // must not be parsed as another choice in that same paragraph.
+    const firstChoice=row.text.match(/^\s*(\*?)\s*([A-H])\s*[.)]\s*(\*?)\s*(.+)$/is);
+    const startsWithChoice=!!firstChoice;
+    const choices=firstChoice ? [{label:firstChoice[2].toUpperCase(),
+      correct:!!(firstChoice[1]||firstChoice[3]),text:firstChoice[4]}] : [];
     if(startsWithChoice&&choices.length){
       for(const choice of choices){
-        const optionHtml=choices.length===1 ? qtiHtmlWithoutChoicePrefix(row.html) : esc(choice.text);
+        const optionHtml=qtiHtmlWithoutChoicePrefix(row.html);
         current={label:choice.label,html:optionHtml,correct:choice.correct};
         q.choices.push(current);
       }
@@ -1020,8 +1304,50 @@ function qtiCompileQuestion(q,body,bank){
     }
   }
   q.stem=removeAnswerKeyFromStem(q.stem);
+  // When Word marks one otherwise unmarked choice with both bold and italic,
+  // treat it as an unconfirmed candidate, never as a verified answer key.
+  // This preserves scientific name formatting while requiring user review.
+  const marked=q.choices.filter(c=>c.correct);
+  if(!marked.length){
+    const decorated=q.choices.filter(c=>/<(?:strong|b)\b/i.test(c.html) && /<(?:em|i)\b/i.test(c.html));
+    if(decorated.length===1){
+      decorated[0].correct=true;
+      q.parseIssues.push({level:"review",code:"format_based_answer",
+        text:"The highlighted answer may be correct. Please verify the answer choice."});
+    }
+  }
   if(q.choices.filter(c=>c.correct).length>1)q.type="multiple_answers_question";
   // A source with only one choice stays incomplete rather than invented.
+}
+function qtiIndependentMcQuestionCount(records){
+  // Independently detect numbered stems each followed by their own lettered
+  // answer block. Stop at a new numbered line or a named answer-pool heading;
+  // this protects nested Matching descriptions and IST ordering lists.
+  let count=0;
+  const candidates=[];
+  for(let i=0;i<records.length;i++){
+    const entry=records[i],num=qtiNumberedValue(entry.text);
+    if(!num || num.value.length<8 || /^(?:Options|Medical Terms|Meanings|Correct Answers)/i.test(num.value))continue;
+    let choiceCount=0,starred=0,blocked=false;
+    for(let j=i+1;j<records.length;j++){
+      const r=records[j],t=r.text;
+      if(qtiNumberedValue(t) || r.kind==="table" || /^(?:Options|Medical\s+Terms?|Meanings?|IST|Correct\s+(?:Answer|Match))/i.test(t)){blocked=true;break;}
+      if(/^\s*\*?\s*[A-H][.)]\s*/i.test(t)){
+        choiceCount++;
+        if(/^\s*\*/.test(t))starred++;
+      }
+      if(choiceCount>=4)break;
+    }
+    if(choiceCount>=2 && starred>=1)candidates.push(num.index);
+  }
+  return candidates.length;
+}
+function detectSourcePointsRule(html){
+  const text=textFromHtml(String(html||"").replace(/<\/p>/gi,"</p>\n"));
+  const match=text.match(/\bAll\s+questions\s+(?:are|worth|have)\s+(?:worth\s+)?(\d+(?:\.\d+)?)\s+points?\s+each\b/i) ||
+    text.match(/\bEach\s+question\s+(?:is\s+worth|has)\s+(\d+(?:\.\d+)?)\s+points?\b/i);
+  const points=match?Number(match[1]):null;
+  return points!=null&&Number.isFinite(points)&&points>0?points:null;
 }
 function parseHtmlToGroups(html,sourceName){
   const runId=++parseRunSequence;
@@ -1029,6 +1355,7 @@ function parseHtmlToGroups(html,sourceName){
   const groupRx=/^(U\s*\d+)\s*[–—−-]\s*(L\s*\d+)\s*[–—−-]\s*Group\s*#?\s*(\d+)\s*[:–—−-]\s*(.+)$/i;
   const groups=[];
   let bank=null,current=null,questionSerial=0,feedbackMode=false,skipReferences=false;
+  let pendingCaseIntro=[];
   const unmatchedHeadings=[];
   let pendingHeading="";
   const finishQuestion=()=>{
@@ -1059,31 +1386,47 @@ function parseHtmlToGroups(html,sourceName){
       bank={id:`bank_${runId}_${groups.length+1}_${sourceName.replace(/\W/g,"_")}`,sourceName,
         unit:title[1].toUpperCase().replace(/\s+/g,""),lesson:title[2].toUpperCase().replace(/\s+/g,""),number:Number(title[3]),title:title[4].trim(),
         feedback:"",questions:[],issues:[],parseIssues:[],status:"good",teacherNotes:[],requiresImage:false,imageUrl:"",forceDropdown:false,sourceNumberedQuestionCount:0};
-      groups.push(bank);feedbackMode=false;skipReferences=false;questionSerial=0;continue;
+      groups.push(bank);feedbackMode=false;skipReferences=false;questionSerial=0;pendingCaseIntro=[];continue;
     }
     if(!bank)continue;
+    (bank.sourceEvents ||= []).push(event);
     const text=event.text;
     if(dom.excludeReferences.checked&&/^References?\s*:?$/i.test(text)){skipReferences=true;continue;}
     if(skipReferences)continue;
-    if(/^(?:set|general)\s+feedback\s*:?$/i.test(text)){
+    if(/^(?:set|general)\s+feedback\s*[:–—-]?\s*$/i.test(text)){
       bank.feedbackExpected=true;feedbackMode=true;continue;
     }
-    const feedbackInline=text.match(/^(?:set|general)\s+feedback\s*:\s*(.+)$/i);
-    if(feedbackInline){bank.feedbackExpected=true;bank.feedback=[bank.feedback,esc(feedbackInline[1])].filter(Boolean).join("<br>");feedbackMode=true;continue;}
+    const feedbackInline=text.match(/^(?:set|general)\s+feedback\s*[:–—-]\s*(.+)$/i);
+    if(feedbackInline){
+      bank.feedbackExpected=true;
+      // Strip the source marker, but keep its bold/italic Word text runs.
+      const formatted=stripLeadingTextPrefix(event.html,/^\s*(?:Set|General)\s+Feedback\s*[:–—-]\s*/i);
+      bank.feedback=[bank.feedback,formatted||esc(feedbackInline[1])].filter(Boolean).join("<br>");
+      feedbackMode=true;continue;
+    }
     const isIST=/^(?:IST|BV\s+ticket)\s*:/i.test(text);
-    if(isIST){
+    const productionImage=/^(?:Add\s+feedback\s+image|Question\s+stem\s+image|image\s+pending|Pilus|Capsule|Cell\s+wall|Nucleoid)\s*[:=]/i.test(text) ||
+      /^https?:\/\/adtalempdcd\.go\.easyprojects\.net\//i.test(text);
+    if(isIST||productionImage){
       bank.teacherNotes.push(text);
-      if(/image.*(?:all questions|each question|this set)|placeholder.*image/i.test(text))bank.requiresImage=true;
+      if(/(?:shared|all questions|each question|this set|this pool|question stem image|same image)/i.test(text) && /image/i.test(text))bank.requiresImage=true;
+      if(/^(?:Question\s+stem\s+image)\s*:/i.test(text))bank.requiresImage=true;
       if(/drop[- ]?downs?|drop down/i.test(text))bank.forceDropdown=true;
-      if(current)current.sourceEvents.push(event); // Answer-bearing ordering IST retained internally.
+      if(current&&isIST)current.sourceEvents.push(event); // Ordering IST is retained for internal parsing.
+      // A feedback-image ticket is a *production dependency*, not feedback text.
+      if(/^Add\s+feedback\s+image/i.test(text))bank.feedbackImagePending=true;
       continue;
     }
-    const numbered=qtiNumberedValue(text);
+    // Standalone 1./2./3. introduces a clinical case whose patient record
+    // follows in subsequent paragraphs; no question mark is required.
+    const bareNumber=text.match(/^\s*(\d+)\s*[.),]\s*$/);
+    const numbered=qtiNumberedValue(text) || (bareNumber?{index:Number(bareNumber[1]),value:""}:null);
     const candidate=qtiQuestionStemCandidate(text);
-    const numberedSentence=!!numbered && numbered.value.length>=45 &&
-      /\b(?:client|patient|select|match|identify|choose|correct|diagnos|medical term|word part|symptom|condition|procedure|question)\b/i.test(numbered.value) &&
-      !/^(?:Options|Medical\s+Terms|Meanings|Correct\s+(?:Answers?|Matches?))\b/i.test(numbered.value) &&
-      !/\b\d+\s*_{2,}/.test(numbered.value);
+    // Numbered outer stems can begin with ANY subject ("The...", "In terms...",
+    // "During..."), contain literal blanks, and end in a period or ellipsis.
+    // Determine boundaries from preceding completed answer sets, NOT vocabulary.
+    const numberedSentence=!!numbered && numbered.value.length>=8 &&
+      !/^(?:Options|Medical\s+Terms|Meanings|Correct\s+(?:Answers?|Matches?))\b/i.test(numbered.value);
     const priorHasKey=current && current.sourceEvents.some(e=>isAnswerKeyEvent(e.text));
     const priorHasChoices=current && current.sourceEvents.some(e=>
       e.kind==="table" || /^\s*\*?\s*[A-H][.)]/i.test(e.text) ||
@@ -1110,9 +1453,30 @@ function parseHtmlToGroups(html,sourceName){
     const orderNoteAt=priorEvents.findIndex(e=>/^IST\s*:\s*Correct\s+order\s+and\s+terms/i.test(e.text));
     const priorHasOrderedTerms=orderNoteAt>=0 && priorEvents.slice(orderNoteAt+1).some(e=>!!qtiNumberedValue(e.text));
     const previousQuestionCompleted=priorHasKey||priorHasChoices||priorHasDropdownOptions||priorHasOrderedTerms;
-    if(event.kind!=="table" && explicitNumberedStem)bank.sourceNumberedQuestionCount++;
-    const isNewQuestion=event.kind!=="table" && (candidate||numberedSentence) && (
-      !current || (previousQuestionCompleted && (numbered ? (explicitNumberedStem||numberedSentence) : candidate)));
+    // Internal numbered descriptions and ordering terms have no completed
+    // choice block before them, so they stay inside the current question.
+    const meaningsAt=priorEvents.findIndex(e=>/^Meanings?\s*:/i.test(e.text));
+    const insideMeaningList=meaningsAt>=0 && !priorHasKey;
+    // Numbered teacher answer lists are NOT question openers. In particular,
+    // "2. Adren/o, Adrenal/o" or "3. Antidiuretic hormone" belong to a
+    // Correct Answers list, even if they are longer than eight characters.
+    const keyAt=priorEvents.findIndex(e=>isAnswerKeyEvent(e.text));
+    const entriesAfterKey=keyAt>=0?priorEvents.slice(keyAt+1):[];
+    const inOrderedKey=keyAt>=0 && entriesAfterKey.some(e=>
+      /^\s*\d+\s*[.)]\s+/.test(e.text) || e.kind==="numbered-list");
+    const keyListValue=!!numbered && (inOrderedKey ||
+      (priorHasKey && /\/o\b|^.{0,35}$/.test(numbered.value))) &&
+      !/^(?:match|select|place|which|what|how|identify|choose|complete|using|the client|a client)\b/i.test(numbered.value);
+    const bareQuestion=!!bareNumber && (!current || previousQuestionCompleted);
+    const structuralNumberedStem=!!numbered && numberedSentence && !keyListValue &&
+      (!current || previousQuestionCompleted) &&
+      // A numbered term inside IST ordering or Matching meanings is NEVER
+      // a new question; only the next explicit outer stem can close the item.
+      !(orderNoteAt>=0 && priorHasOrderedTerms && !explicitNumberedStem) &&
+      !(insideMeaningList && !explicitNumberedStem);
+    const isNewQuestion=event.kind!=="table" && (candidate||structuralNumberedStem||bareQuestion) && (
+      !current || (previousQuestionCompleted && (numbered ? (structuralNumberedStem||bareQuestion||explicitNumberedStem) : candidate)));
+    if(event.kind!=="table" && isNewQuestion && numbered)bank.sourceNumberedQuestionCount++;
     // If the source repeats a plausible outer number before the preceding
     // answer pool exists, retain the content rather than dropping it. Mark
     // the ambiguous split for human review.
@@ -1121,10 +1485,14 @@ function parseHtmlToGroups(html,sourceName){
         current.parseIssues.push({level:"review",code:"question_boundary_ambiguous",
           text:"We couldn't confirm where this question starts or ends. Please review the question."});
     }
-    const numberedOpening=!!numbered && (candidate||numberedSentence);
+    const numberedOpening=!!numbered && (candidate||structuralNumberedStem);
     const standaloneUnnumbered=/\?/.test(text) && /^(?:Which|What|How|Select|Identify|Match|Choose|A client|The client)\b/i.test(text);
-    const realOpeningInFeedback=event.kind!=="table" && (numberedOpening || (bank.feedback && standaloneUnnumbered));
+    const realOpeningInFeedback=event.kind!=="table" &&
+      (structuralNumberedStem || bareQuestion || explicitNumberedStem || (bank.feedback && standaloneUnnumbered));
     if(feedbackMode){
+      if(/^Scenario\s*:?$/i.test(text)){
+        pendingCaseIntro.push(event.html);continue;
+      }
       if(!realOpeningInFeedback){
         if(text.length<=3 && !bank.feedback){
           bank.parseIssues.push({level:"review",text:`Unrecognized short text after set feedback: ${text}. Confirm whether it belongs in the feedback.`});
@@ -1136,7 +1504,9 @@ function parseHtmlToGroups(html,sourceName){
     if(isNewQuestion){
       finishQuestion();
       const stem=numbered?qtiStripQuestionNumber(event.html):event.html;
-      current=qtiNewQuestion(bank,++questionSerial,stem);
+      current=qtiNewQuestion(bank,++questionSerial,
+        [...pendingCaseIntro,stem].filter(Boolean).join("<br>"));
+      pendingCaseIntro=[];
       if(!numbered && questionSerial>1)current.parseIssues.push({level:"review",code:"question_boundary",text:"Unnumbered question boundary identified from the question text. Confirm the split."});
       continue;
     }
@@ -1145,9 +1515,15 @@ function parseHtmlToGroups(html,sourceName){
     if(text.length>3)bank.parseIssues.push({level:"review",text:`Content before first question was not classified: ${text.slice(0,120)}`});
   }
   finishQuestion();
-  // A safety check independent of the created questions: a future boundary
-  // regression must not silently merge numbered questions into one item.
-  // Check only at initial import; intentional manual deletions remain possible.
+  // Independently count numbered MC openings with their OWN lettered choices.
+  // A missed first question must not be hidden by subsequent Good questions.
+  for(const g of groups){
+    const independent=qtiIndependentMcQuestionCount(g.sourceEvents||[]);
+    g.independentMcQuestionCount=independent;
+    if(independent>=2 && g.questions.length<independent)
+      g.parseIssues.push({level:"correction",code:"missing_source_questions",
+        text:`Some questions may be missing: the document contains at least ${independent} numbered questions with answer options, but only ${g.questions.length} were imported.`});
+  }
   for(const g of groups){
     if(g.sourceNumberedQuestionCount>=2 && g.questions.length<g.sourceNumberedQuestionCount)
       g.parseIssues.push({level:"correction",code:"possible_question_merge",
@@ -1181,12 +1557,26 @@ function parseHtmlToGroups(html,sourceName){
       feedback:"",questions:[],issues:[],status:"correction",parseIssues:[{level:"correction",text:"No U/L/Group headings were recognized in the source document."}],
       teacherNotes:[],requiresImage:false,imageUrl:"",forceDropdown:false});
   }
-  for(const group of groups)for(const [i,q] of group.questions.entries()){
-    q.index=i+1;q.itemTitle=questionTitleFromGroupTitle(group.title,i+1);
+  for(const group of groups){
+    group.feedback=removeEmptyRichTextTags(group.feedback);
+    for(const [i,q] of group.questions.entries()){
+      q.index=i+1;q.itemTitle=questionTitleFromGroupTitle(group.title,i+1);
+      q.feedback=removeEmptyRichTextTags(q.feedback);
+    }
   }
   return groups;
 }
 
+function removeEmptyRichTextTags(source){
+  // Small, deterministic HTML cleanup: do not remove tags containing images.
+  let html=String(source||"");
+  for(let i=0;i<5;i++){
+    const cleaned=html.replace(/<(strong|b|em|i|u)\b[^>]*>\s*(?:&nbsp;|\u00a0|<br\s*\/?>|\s)*<\/\1>/gi,"");
+    if(cleaned===html)break;
+    html=cleaned;
+  }
+  return html;
+}
 function safeFeedbackHtml(source) {
   const value=String(source || "").trim();
   if(!value)return "";
@@ -1203,7 +1593,7 @@ function safeFeedbackHtml(source) {
     }
   };
   walk(root);
-  return root.innerHTML;
+  return removeEmptyRichTextTags(root.innerHTML);
 }
 
 function generalFeedbackHtml(question, group) {
@@ -1211,7 +1601,9 @@ function generalFeedbackHtml(question, group) {
   // ONLY when manually edited/confirmed as explicitly authored feedback.
   const notes=question.matchingNotesAuthored && question.matchingNotes?.length
     ? `<ul>${question.matchingNotes.join("")}</ul>` : "";
-  return [question.feedback,notes,group.feedback]
+  const feedbackImage=canonicalCdnImageUrl(group.feedbackImageUrl || "");
+  const imageMarkup=feedbackImage?`<p><img style="display: block; margin-left: auto; margin-right: auto;" role="presentation" src="${esc(feedbackImage)}" alt="Feedback illustration" width="640" height="360" /></p>`:"";
+  return [question.feedback,notes,group.feedback,imageMarkup]
     .filter(Boolean).map(html=>removeAnswerKeyFromStem(html)).filter(Boolean).join("<br><br>");
 }
 
@@ -1242,6 +1634,15 @@ function validateQuestion(group, question, index) {
   question.issues = (question.parseIssues || []).filter(issue=>
     !(question.reviewConfirmed && isManualReviewIssue(issue)));
   if (question.draft) question.issues.push({level:"review",text:"Draft saved. Review the question and select Save Changes when finished."});
+  // Missing shared media is a dependency for ALL question types, not merely
+  // Multiple Dropdowns. The answer key may be valid, but the exam is not ready.
+  if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || ""))
+    question.issues.push({level:"review",text:"Shared image is pending. Insert the verified labeled image before publishing."});
+  if (unresolvedQuestionImageReference(question,group))
+    question.issues.push({level:"review",code:"missing_question_image",text:"The source question refers to a picture or diagram, but no image was provided. Insert and verify the image before publishing."});
+  const sourcePoints=group.sourcePointsPerQuestion;
+  if (sourcePoints!=null && Number(question.points===""||question.points==null?dom.defaultPoints.value:question.points)!==sourcePoints)
+    question.issues.push({level:"review",code:"source_points_mismatch",text:`Word specifies ${sourcePoints} points per question; this item is configured differently. Confirm or adjust its points.`});
 
   const type = question.type;
   const stemText = textFromHtml(question.stem);
@@ -1277,7 +1678,8 @@ function validateQuestion(group, question, index) {
 
     const duplicates = new Set();
     question.choices.forEach(choice => {
-      const key = normalizeSpaces(textFromHtml(choice.html)).toLowerCase();
+      const key = normalizeSpaces(textFromHtml(choice.html)).toLowerCase()+
+        (/<(?:em|i|strong|b|u)\b/i.test(choice.html) ? "|rich:"+String(choice.html).replace(/\s+/g," ").toLowerCase() : "");
       if (key) {
         if (duplicates.has(key)) {
           question.issues.push({ level: "review", text: "Duplicate answer choices were detected." });
@@ -1298,7 +1700,7 @@ function validateQuestion(group, question, index) {
       if (correct.length !== 1) question.issues.push({level:"correction",text:`Dropdown ${blank.id} requires exactly one correct option (found ${correct.length}).`});
       if (new Set((blank.options||[]).map(o=>o.text.toLowerCase().trim())).size !== (blank.options||[]).length) question.issues.push({level:"correction",text:`Dropdown ${blank.id} contains duplicate options.`});
     }
-    if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || "")) question.issues.push({level:"review",text:"Shared diagram is pending: LXD must insert the image before publishing."});
+
   } else if (type === "matching_question") {
     if (question.pairs.length < 2) {
       question.issues.push({ level: "correction", text: "Matching question must contain at least two pairs." });
@@ -1327,6 +1729,8 @@ function validateQuestion(group, question, index) {
 function validateGroup(group) {
   group.issues = [...(group.parseIssues || [])];
   if(group.feedbackExpected && !group.feedback.trim())group.issues.push({level:"correction",text:"The source declares Set Feedback, but its content was not imported."});
+  if(group.feedbackImagePending && !canonicalCdnImageUrl(group.feedbackImageUrl || ""))
+    group.issues.push({level:"review",text:"The feedback image is pending. Add the verified image before publishing."});
   if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || "")) group.issues.push({level:"review",text:"Shared labeled image requested by IST; LXD placeholder is not yet replaced."});
   const qPerSet = Number(dom.questionsPerSet.value || 0);
   if (qPerSet && group.questions.length !== qPerSet) {
@@ -1383,6 +1787,7 @@ function isBoundaryReviewIssue(issue){
 function isManualReviewIssue(issue){
   if(!issue || issue.level!=="review")return false;
   return isBoundaryReviewIssue(issue) || issue.code==="question_boundary_ambiguous" ||
+    issue.code==="format_based_answer" ||
     /no explicit answer key or structural table header|confirm that each table row is a correct direct pair/i.test(issue.text||"");
 }
 function hasManualReviewIssue(question){
@@ -1491,6 +1896,7 @@ function renderAll() {
   renderValidationPanel();
   renderFiles();
   renderSummaryOverview();
+  updateNextQuestionButton();
 }
 
 function renderSummaryOverview() {
@@ -1598,6 +2004,7 @@ function renderBankList() {
 
   dom.bankList.querySelectorAll("[data-bank-id]").forEach(card => {
     card.addEventListener("click", () => {
+      if(!confirmLeaveUnsavedEditor())return;
       state.selectedBankId = card.dataset.bankId;
       const targetGroup = state.groups.find(group => group.id === state.selectedBankId);
       // Select the first question that satisfies the active filters.
@@ -1662,6 +2069,7 @@ function selectQuestion(questionId, tab = null) {
   if (!question) return;
   const group = state.groups.find(g => g.id === question.groupId);
   if (!group || !matchesFilters(group, question)) return;
+  if(questionId!==state.selectedQuestionId && !confirmLeaveUnsavedEditor())return;
   state.selectedBankId = group.id;
   state.selectedQuestionId = question.id;
   dom.questionList.querySelectorAll("[data-question-id]").forEach(card => {
@@ -1672,6 +2080,7 @@ function selectQuestion(questionId, tab = null) {
   if (tab) switchTab(tab);
   renderEditor();
   renderPreview();
+  updateNextQuestionButton();
 }
 
 dom.questionList.addEventListener("click", event => {
@@ -1772,7 +2181,11 @@ function convertQuestionType(question,nextType) {
     }
     const correctCount=answerChoices.filter(c=>c.correct).length;
     const compatible=nextType==="multiple_choice_question"?correctCount===1:correctCount>=2;
-    return {choices:answerChoices.length>=2?answerChoices:[...answerChoices,...Array.from({length:2-answerChoices.length},()=>({label:"",html:"",correct:false}))],
+    // Converting Multiple Answers -> Multiple Choice must never silently
+    // choose one of the multiple marked correct answers. Require a fresh pick.
+    const convertedChoices=nextType==="multiple_choice_question"&&correctCount>1
+      ?answerChoices.map(c=>({...c,correct:false})) : answerChoices;
+    return {choices:convertedChoices.length>=2?convertedChoices:[...convertedChoices,...Array.from({length:2-convertedChoices.length},()=>({label:"",html:"",correct:false}))],
       pairs:[],blanks:[],stem:cleanOldBlanks,draft:!compatible};
   }
   if(nextType==="matching_question"){
@@ -1804,6 +2217,52 @@ function refreshReviewAfterEdit(message, kind="good") {
   revalidateAll();renderAll();
   if(message) setStatus(esc(message),kind);
 }
+function formattingToolbar(fieldId){
+  const actions=[
+    ["bold","B","Bold (select text first)"],
+    ["italic","I","Italic (select text first)"],
+    ["ul","• List","Bulleted list (select lines first)"],
+    ["ol","1. List","Numbered list (select lines first)"]
+  ];
+  return `<div class="html-format-toolbar" role="toolbar" aria-label="HTML formatting tools">${actions.map(([action,label,title])=>
+    `<button class="format-action format-${action}" type="button" data-format-action="${action}" data-format-field="${fieldId}" title="${esc(title)}" aria-label="${esc(title)}">${label}</button>`).join("")}</div>`;
+}
+function formatSelectedHtmlField(textarea,action){
+  const start=textarea.selectionStart,end=textarea.selectionEnd;
+  if(start===end){setStatus("Select the text or lines you want to format first.","review");textarea.focus();return false;}
+  const selected=textarea.value.slice(start,end);
+  // Do not wrap partial HTML tags: doing so can destroy Word formatting.
+  const before=textarea.value.slice(0,start);
+  if(before.lastIndexOf("<")>before.lastIndexOf(">") || selected.includes("<")!==selected.includes(">") ||
+      ((selected.match(/</g)||[]).length!==(selected.match(/>/g)||[]).length)){
+    setStatus("Select only text or complete HTML elements before formatting.","review");textarea.focus();return false;
+  }
+  let replacement;
+  if(action==="bold"||action==="italic"){
+    const tag=action==="bold"?"strong":"em";
+    replacement=`<${tag}>${selected}</${tag}>`;
+  }else if(action==="ul"||action==="ol"){
+    const lines=selected.replace(/<br\s*\/?>/gi,"\n").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    if(!lines.length)return false;
+    const li=lines.map(line=>`<li>${line.replace(/^<p[^>]*>/i,"").replace(/<\/p>$/i,"")}</li>`).join("\n");
+    replacement=`<${action}>\n${li}\n</${action}>`;
+  }else return false;
+  textarea.setRangeText(replacement,start,end,"select");
+  textarea.dispatchEvent(new Event("input",{bubbles:true}));
+  textarea.focus();
+  return true;
+}
+function editorFormFingerprint(){
+  if(!dom.editorPanel.querySelector("#editStem"))return "";
+  const nodes=dom.editorPanel.querySelectorAll("input,textarea,select");
+  return JSON.stringify([...nodes].filter(x=>x.id!=="confirmAnswersCheckbox")
+    .map(el=>[el.id,el.name,el.dataset.choiceText,el.dataset.blankOptions,el.type==="checkbox"||el.type==="radio"?el.checked:el.value]));
+}
+let editorBaselineFingerprint="";
+function confirmLeaveUnsavedEditor(){
+  if(!editorBaselineFingerprint||editorFormFingerprint()===editorBaselineFingerprint)return true;
+  return window.confirm("You have unsaved changes in Step 4. Leave this question without saving? Use Save Changes first to keep your edits.");
+}
 function renderEditor() {
   const question=selectedQuestion();
   const group=state.groups.find(g=>g.id===question?.groupId);
@@ -1829,7 +2288,7 @@ function renderEditor() {
     inputMarkup=`<div class="editor-group"><h3>Choices</h3><div id="choiceContainer">
       ${(question.choices||[]).map((c,i)=>`<div class="choice-row"><div class="mini-label">${String.fromCharCode(65+i)}</div>
         <input type="text" data-choice-text="${i}" value="${esc(textFromHtml(c.html))}" placeholder="Answer choice">
-        <label class="toggle"><input type="checkbox" data-choice-correct="${i}" ${c.correct?"checked":""}><span>Correct</span></label>
+        <label class="toggle"><input type="${question.type==="multiple_answers_question"?"checkbox":"radio"}" name="${question.type==="multiple_answers_question"?`choice_${i}`:"single_correct_choice"}" data-choice-correct="${i}" ${c.correct?"checked":""}><span>Correct</span></label>
         <button type="button" class="icon-btn" data-delete-choice="${i}">Delete</button></div>`).join("")}</div>
       ${question.type!=="true_false_question"?'<button type="button" class="small-btn" id="addChoiceBtn">Add choice</button>':""}</div>`;
   } else {
@@ -1847,15 +2306,16 @@ function renderEditor() {
       <label class="field"><span>Item title</span><input id="editItemTitle" value="${esc(question.itemTitle)}"></label>
       <label class="field"><span>Question type</span><select id="editType">${types.map(([type,label])=>`<option value="${type}" ${question.type===type?"selected":""}>${label}</option>`).join("")}</select></label>
       <label class="field"><span>Points</span><input id="editPoints" type="number" min="0.01" step="0.01" value="${esc(question.points===""?dom.defaultPoints.value:question.points)}"></label>
-      <label class="field"><span>Stem HTML</span><textarea id="editStem" rows="6">${esc(question.stem||"")}</textarea><small class="validation-help">HTML tags and CDN images are preserved.</small></label>
+      <label class="field"><span>Stem HTML</span>${formattingToolbar("editStem")}<textarea id="editStem" rows="6">${esc(question.stem||"")}</textarea><small class="validation-help">HTML tags and CDN images are preserved.</small></label>
     </div>
     ${inputMarkup}
     <div class="editor-group"><h3>Feedback</h3>
-      <label class="field"><span>Question rationale / feedback</span><textarea id="editFeedback" rows="4">${esc(question.feedback||"")}</textarea></label>
+      <label class="field"><span>Question rationale / feedback</span>${formattingToolbar("editFeedback")}<textarea id="editFeedback" rows="4">${esc(question.feedback||"")}</textarea></label>
       ${question.type==="matching_question"?`<label class="field"><span>Matching explanations (one per line)</span><textarea id="editMatchingNotes" rows="4">${esc((question.matchingNotes||[]).map(x=>textFromHtml(x)).join("\n"))}</textarea></label>`:""}
-      ${group.requiresImage?`<label class="field"><span>Shared image URL</span><input id="editSharedImage" type="url" placeholder="https://cdn-media..." value="${esc(group.imageUrl||"")}"></label>`:""}
+      ${group.requiresImage?`<label class="field"><span>Shared image URL (student question stem)</span><input id="editSharedImage" type="url" placeholder="https://cdn-media..." value="${esc(group.imageUrl||"")}"></label>`:""}
+      ${group.feedbackImagePending?`<label class="field"><span>Feedback image URL (optional, separate from the shared stem image)</span><input id="editFeedbackImage" type="url" placeholder="https://cdn-media..." value="${esc(group.feedbackImageUrl||"")}"></label>`:""}
       ${group.teacherNotes?.length||question.internalNotes?.length?`<details><summary>Internal production notes (not exported)</summary>${[...(group.teacherNotes||[]),...(question.internalNotes||[])].map(t=>`<p>${esc(t)}</p>`).join("")}</details>`:""}
-      <label class="field"><span>Group feedback (applied to every question)</span><textarea id="editGroupFeedback" rows="4">${esc(group.feedback||"")}</textarea></label>
+      <label class="field"><span>Group feedback (applied to every question)</span>${formattingToolbar("editGroupFeedback")}<textarea id="editGroupFeedback" rows="4">${esc(group.feedback||"")}</textarea></label>
     </div>
     ${hasManualReviewIssue(question) && !question.reviewConfirmed ? `<label class="manual-review-confirm">
       <input type="checkbox" id="confirmAnswersCheckbox" ${question.reviewConfirmed ? "checked" : ""}>
@@ -1874,6 +2334,14 @@ function renderEditor() {
       <button type="button" id="cancelTypeBtn" class="btn btn-quiet">Cancel</button></div>
     </div>
   </div>`;
+  dom.editorPanel.querySelectorAll("[data-format-action]").forEach(button=>{
+    button.addEventListener("mousedown",event=>event.preventDefault());
+    button.addEventListener("click",()=>{
+      const target=dom.editorPanel.querySelector(`#${button.dataset.formatField}`);
+      if(target)formatSelectedHtmlField(target,button.dataset.formatAction);
+    });
+  });
+  editorBaselineFingerprint=editorFormFingerprint();
   const readForm=()=>{
     const title=document.getElementById("editItemTitle").value.trim();
     question.customTitle=Boolean(title&&title!==questionTitleFromGroupTitle(group.title,question.index));
@@ -1883,6 +2351,7 @@ function renderEditor() {
     question.feedback=safeFeedbackHtml(document.getElementById("editFeedback").value);
     group.feedback=safeFeedbackHtml(document.getElementById("editGroupFeedback").value);
     const image=document.getElementById("editSharedImage");if(image)group.imageUrl=image.value.trim();
+    const feedbackImage=document.getElementById("editFeedbackImage");if(feedbackImage)group.feedbackImageUrl=feedbackImage.value.trim();
     if(question.type==="matching_question"){
       question.pairs=[...dom.editorPanel.querySelectorAll("[data-pair-left]")].map((input,i)=>({
         left:input.value.trim(),right:dom.editorPanel.querySelector(`[data-pair-right="${i}"]`)?.value.trim()||""
@@ -1996,6 +2465,31 @@ function renderEditor() {
   };
 }
 
+function nextVisibleQuestion(){
+  const eligible=visibleGroups().flatMap(g=>g.questions.filter(q=>matchesFilters(g,q)));
+  const index=eligible.findIndex(q=>q.id===state.selectedQuestionId);
+  return index>=0?eligible[index+1]||null:null;
+}
+function updateNextQuestionButton(){
+  if(!dom.nextQuestionBtn)return;
+  dom.nextQuestionBtn.disabled=!nextVisibleQuestion();
+}
+dom.nextQuestionBtn.addEventListener("click",()=>{
+  const target=nextVisibleQuestion();
+  if(!target)return;
+  if(!confirmLeaveUnsavedEditor())return;
+  const group=state.groups.find(g=>g.id===target.groupId);
+  if(!group)return;
+  const bankChanged=group.id!==state.selectedBankId;
+  state.selectedBankId=group.id;state.selectedQuestionId=target.id;
+  if(bankChanged){renderBankList();renderQuestionList();}
+  else dom.questionList.querySelectorAll("[data-question-id]").forEach(card=>{
+    const active=card.dataset.questionId===target.id;
+    card.classList.toggle("selected",active);card.setAttribute("aria-current",String(active));
+  });
+  renderEditor();renderPreview();renderValidationPanel();updateNextQuestionButton();
+  dom.questionList.querySelector(`[data-question-id="${CSS.escape(target.id)}"]`)?.scrollIntoView({block:"nearest",behavior:"smooth"});
+});
 dom.expandEditorBtn.addEventListener("click",()=>{
   state.editorExpanded=!state.editorExpanded;
   document.querySelector("#reviewView .inspector").classList.toggle("expanded",state.editorExpanded);
@@ -2121,6 +2615,7 @@ function runValidation() {
       correction: questions.filter(q => q.status === "correction").length
     },
     settings: {
+      source_point_rules: {...state.sourcePointRules},
       default_points: Number(dom.defaultPoints.value || 1),
       questions_per_set: Number(dom.questionsPerSet.value || 0) || null,
       include_heading_in_stem: dom.includeHeading.checked,
@@ -2131,9 +2626,10 @@ function runValidation() {
     banks: state.groups.map(group => ({
       name: `${group.unit} – ${group.lesson} – Group ${group.number}: ${group.title}`,
       source_name: group.sourceName,
+      source_points_per_question: group.sourcePointsPerQuestion ?? null,
       status: group.status,
       issues: group.issues.map(issue => issue.text),
-      requires_image: !!group.requiresImage,
+      requires_image: !!group.requiresImage || group.questions.some(q=>unresolvedQuestionImageReference(q,group)),
       image_placeholder_pending: !!group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || ""),
       internal_notes: group.teacherNotes || [],
       questions: group.questions.map(question => ({
@@ -2146,6 +2642,19 @@ function runValidation() {
         internal_notes: question.internalNotes || [],
         draft: !!question.draft,
         general_feedback_present: !!generalFeedbackHtml(question,group),
+        unresolved_question_image: unresolvedQuestionImageReference(question,group),
+        content_audit: {
+          stem_html: question.stem || "",
+          choices: question.type === "multiple_choice_question" || question.type === "multiple_answers_question" || question.type === "true_false_question"
+            ? question.choices.map(c=>({label:c.label,html:c.html,correct:!!c.correct})) : [],
+          matching_pairs: question.type === "matching_question" ? question.pairs.map(p=>({left:p.left,right:p.right})) : [],
+          dropdowns: question.type === "multiple_dropdowns_question" ? question.blanks.map(b=>({
+            id:b.id,prompt:b.prompt,choices:b.options.map(o=>({text:o.text,correct:!!o.correct}))
+          })) : [],
+          group_feedback_html: group.feedback || "",
+          question_feedback_html: question.feedback || "",
+          general_feedback_html: generalFeedbackHtml(question,group)
+        },
         issues: question.issues.map(issue => issue.text)
       }))
     }))
@@ -2445,12 +2954,17 @@ async function buildCombinedZip() {
   const manifestXml=manifest(resources);
   assertManifestXml(manifestXml,resources);
   zip.file("imsmanifest.xml",manifestXml);
-  if (state.validation) zip.file("validation.json", JSON.stringify(state.validation, null, 2));
+  // Keep the import package limited to manifest + QTI XML resources.
+  // Download validation reports separately through the app's report control.
   return zip;
 }
 
 async function buildIndividualBundle() {
   const bundle = new JSZip();
+  bundle.file("READ_ME_FIRST.txt", "Canvas QTI Studio v3.13: This bundle is an archive of individual bank QTI ZIP files.\n" +
+    "DO NOT upload this outer bundle to Canvas. Extract it, then import each inner ZIP via Settings > Import Course Content > QTI .zip file.\n" +
+    "For a single QTI package upload, use the Combined QTI ZIP export mode instead.\n" +
+    "Verify bank creation and question accuracy in a test Canvas course before production.\n");
   for (let i = 0; i < state.groups.length; i += 1) {
     const group = state.groups[i];
     const inner = new JSZip();
@@ -2461,7 +2975,6 @@ async function buildIndividualBundle() {
     const manifestXml=manifest(resources);
     assertManifestXml(manifestXml,resources);
     inner.file("imsmanifest.xml",manifestXml);
-    if (state.validation) inner.file("validation.json", JSON.stringify(state.validation, null, 2));
     const safeName = `${group.unit}_${group.lesson}_group_${group.number}_${group.title}`.replace(/[^A-Za-z0-9_-]+/g, "_");
     bundle.file(`${String(i + 1).padStart(2, "0")}_${safeName}.zip`, await inner.generateAsync({ type: "blob" }));
   }
