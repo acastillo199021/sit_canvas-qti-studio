@@ -9,12 +9,16 @@ const state = {
   activeTab: "editor",
   activeView: "setup",
   questionTypeFilter: "all",
+  unitFilter: "all",
+  lessonFilter: "all",
+  sourceCommentsByFile: {},
   issueFilter: "all",
   feedbackFilter: "all",
   importWarnings: [],
   sourcePointRules: {},
   defaultPointsUserEdited: false,
   editorExpanded: false,
+  selectedForMove: new Set(),
   idSequence: 0
 };
 
@@ -26,6 +30,8 @@ const dom = {
   outputMode: document.getElementById("outputMode"),
   searchBox: document.getElementById("searchBox"),
   questionTypeFilter: document.getElementById("questionTypeFilter"),
+  unitFilter: document.getElementById("unitFilter"),
+  lessonFilter: document.getElementById("lessonFilter"),
   clearFiltersBtn: document.getElementById("clearFiltersBtn"),
   goReviewBtn: document.getElementById("goReviewBtn"),
   downloadReportBtn: document.getElementById("downloadReportBtn"),
@@ -64,6 +70,7 @@ const dom = {
   addQuestionBtn: document.getElementById("addQuestionBtn"),
   expandEditorBtn: document.getElementById("expandEditorBtn"),
   nextQuestionBtn: document.getElementById("nextQuestionBtn"),
+  previousQuestionBtn: document.getElementById("previousQuestionBtn"),
   issueFilterBars: [...document.querySelectorAll(".issue-filter-bar")]
 };
 
@@ -212,6 +219,10 @@ dom.downloadReportBtn.addEventListener("click", () => {
   saveBlob(new Blob([JSON.stringify(state.validation, null, 2)], {type:"application/json"}), "qti_validation_report.json");
 });
 dom.clearFiltersBtn.addEventListener("click", () => clearAllQuestionFilters());
+dom.unitFilter.addEventListener("change",()=>{
+  state.unitFilter=dom.unitFilter.value;state.lessonFilter="all";renderAll();
+});
+dom.lessonFilter.addEventListener("change",()=>{state.lessonFilter=dom.lessonFilter.value;renderAll();});
 dom.questionTypeFilter.addEventListener("change", () => {
   state.questionTypeFilter = dom.questionTypeFilter.value;
   renderAll();
@@ -337,6 +348,7 @@ async function analyzeFiles() {
     state.groups = [];
     state.importWarnings = [];
     state.sourcePointRules = {};
+    state.sourceCommentsByFile = {};
     let allGroups = [];
     const observedSourcePoints = [];
     for (let i = 0; i < state.files.length; i += 1) {
@@ -349,6 +361,8 @@ async function analyzeFiles() {
           "i => em"
         ]
       });
+      try{state.sourceCommentsByFile[file.name]=await readDocxComments(arrayBuffer);}
+      catch(error){console.warn("Word comments could not be read",error);state.sourceCommentsByFile[file.name]=[];}
       const sourceRule = detectSourcePointsRule(result.value);
       if (sourceRule != null) {
         state.sourcePointRules[file.name] = sourceRule;
@@ -356,6 +370,7 @@ async function analyzeFiles() {
       }
       const fileGroups = parseHtmlToGroups(result.value, file.name);
       fileGroups.forEach(g=>g.sourcePointsPerQuestion=sourceRule);
+      attachInternalDocxNotes(fileGroups,state.sourceCommentsByFile[file.name]||[]);
       allGroups = allGroups.concat(fileGroups);
     }
     state.groups = allGroups;
@@ -506,6 +521,52 @@ function parseDropdownOptions(text) {
 // then resolve the specific answer structure. Internal numbered prompts,
 // answer keys, and instructor-only directions never create extra items.
 let parseRunSequence = 0;
+// NOTES-057: Word margin comments are internal review material, never QTI.
+async function readDocxComments(arrayBuffer) {
+  if (typeof JSZip === "undefined") return [];
+  const zip=await JSZip.loadAsync(arrayBuffer);
+  const content=zip.file("word/comments.xml");
+  if(!content)return [];
+  const xml=new DOMParser().parseFromString(await content.async("string"),"application/xml");
+  const docXml=zip.file("word/document.xml");
+  const source=docXml?new DOMParser().parseFromString(await docXml.async("string"),"application/xml"):null;
+  const nsAttr=(el,name)=>el.getAttribute("w:"+name)||el.getAttribute(name)||"";
+  const contentText=el=>[...el.getElementsByTagName("w:t")].map(x=>x.textContent||"").join("").trim();
+  const contexts=new Map();
+  let current={unit:"",lesson:"",number:0};
+  if(source){
+    const headings=/^(U\s*\d+)\s*[–—−-]\s*(L\s*\d+)\s*[–—−-]\s*Group\s*#?\s*(\d+)(?:\s*[:–—−-]\s*|\s+)(.+)$/i;
+    for(const para of [...source.getElementsByTagName("w:p")]){
+      const text=contentText(para);const match=text.match(headings);
+      if(match)current={unit:match[1].replace(/\s+/g,"").toUpperCase(),lesson:match[2].replace(/\s+/g,"").toUpperCase(),number:Number(match[3])};
+      for(const mark of [...para.getElementsByTagName("w:commentRangeStart"),...para.getElementsByTagName("w:commentReference")]){
+        const id=nsAttr(mark,"id");if(id)contexts.set(id,{...current,context:text.slice(0,180)});
+      }
+    }
+  }
+  return [...xml.getElementsByTagName("w:comment")].map(comment=>{
+    const id=nsAttr(comment,"id"),text=contentText(comment);
+    return {id,author:nsAttr(comment,"author"),text,...(contexts.get(id)||{})};
+  }).filter(note=>note.text && !/^(?:Need Mei to confirm where the minus|start here\s*$)/i.test(note.text));
+}
+function attachInternalDocxNotes(groups,notes){
+  for(const note of notes){
+    const group=groups.find(g=>g.unit===note.unit&&g.lesson===note.lesson&&g.number===note.number);
+    if(!group)continue;
+    const text=`${note.author?note.author+": ":""}${note.text}`;
+    const target=group.questions.find(q=>note.context&&q.stem&&
+      textFromHtml(q.stem).toLowerCase().includes(note.context.slice(0,40).toLowerCase()));
+    if(target)target.internalNotes.push(text);
+    else (group.teacherNotes ||= []).push(text+(note.context?` [Source context: ${note.context}]`:""));
+  }
+}
+function isDiagnosticGroup(group){return group?.unit==="SOURCE" && group?.lesson==="CHECK";}
+function normalizeChemicalEquationHtml(html){
+  const value=String(html||"");
+  // Replace a standalone mojibake arrow ONLY in recognizable chemical equations.
+  if(!/\sà\s/.test(value) || !/[+]/.test(textFromHtml(value)))return value;
+  return value.replace(/\sà\s/g," → ");
+}
 function qtiSourceEvents(html) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const events=[];
@@ -552,6 +613,77 @@ function qtiSourceEvents(html) {
   }
   return events;
 }
+// PARSER-080/081/082: A Word automatic list may encode the FIRST answer
+// options as decimal <ol><li> even though the remaining options are written
+// explicitly as *B., C., D. (or *C., D.). This is not a new numbered
+// question. Recover only a bounded, independently corroborated option run;
+// leave medical Matching / dropdown numbering untouched.
+function qtiRecoverAutoLetteredOptions(events){
+  const result=events.map(event=>({...event}));
+  const choiceRx=/^\s*\*?\s*([A-H])\s*[.)]\s*\*?\s*\S/i;
+  const startsQuestion=text=>{
+    const clean=String(text||"").replace(/^\s*\d+\s*[.)]\s*/,"").trim();
+    return qtiQuestionStemCandidate(clean) ||
+      (clean.length>=16 && /\?\s*$/.test(clean) && /^(?:the|an?|in|during|after|before)\b/i.test(clean));
+  };
+  for(let i=0;i<result.length;i++){
+    const first=result[i];
+    if(first.kind!=="numbered-list" || !first.automaticNumbering || startsQuestion(first.text))continue;
+    // Only recover runs at the start of an answer set, after a real question.
+    const previous=result.slice(Math.max(0,i-8),i);
+    const lastBoundary=previous.findLastIndex(e=>/^(?:U\s*\d+\s*[-–—]\s*L\s*\d+\s*[-–—]\s*Group\b|Options\s*:|Medical\s+Terms\s*:|Meanings\s*:|Correct\s+(?:Answers?|Matches?)\s*:|IST\s*:)/i.test(e.text||""));
+    const context=lastBoundary>=0?previous.slice(lastBoundary+1):previous;
+    if(!context.some(e=>startsQuestion(e.text)) || context.some(e=>e.kind==="table"))continue;
+    // A run must be immediately followed by its next explicit answer label.
+    let end=i;
+    while(end<result.length && end-i<8 && result[end].kind==="numbered-list" &&
+       result[end].automaticNumbering && !startsQuestion(result[end].text))end++;
+    const run=result.slice(i,end);
+    const following=result[end];
+    const nextLetter=String(following?.text||"").match(choiceRx)?.[1]?.toUpperCase();
+    const expectedNext=String.fromCharCode(65+run.length);
+    if(!run.length || !nextLetter || nextLetter!==expectedNext)continue;
+    if(run.some((e,k)=>{
+      const plain=String(e.text||"").replace(/^\s*\d+\s*[.)]\s*/,"").trim();
+      const marker=plain.match(choiceRx)?.[1]?.toUpperCase();
+      return marker && marker!==String.fromCharCode(65+k);
+    }))continue;
+    for(let k=0;k<run.length;k++){
+      const e=result[i+k];
+      let cleanHtml=e.html;
+      // Auto-generated number never appears in the original <li> innerHTML;
+      // a manually typed "B." within the same item must be stripped once.
+      cleanHtml=stripLeadingTextPrefix(cleanHtml,/^\s*\d+\s*[.)]\s*/);
+      cleanHtml=stripLeadingTextPrefix(cleanHtml,/^\s*\*?\s*[A-H]\s*[.)]\s*\*?\s*/i);
+      const marked=/^\s*\*/.test(String(e.text||"").replace(/^\s*\d+\s*[.)]\s*/,""));
+      const label=String.fromCharCode(65+k);
+      e.html=`${marked?"*":""}${label}. ${cleanHtml}`;
+      e.text=textFromHtml(e.html).trim();
+      e.kind="letter-list";
+      e.automaticNumbering=false;
+      e.automaticLettering=true;
+      e.sourceAutoChoiceRecovered=true;
+      e.sourceAutoNumber=run[k].listIndex;
+    }
+    i=end-1;
+  }
+  return result;
+}
+
+// Source-level answer evidence survives editor re-numbering and Save Changes.
+// It validates structural option retention without forcing exact wording
+// to remain unchanged when an instructor deliberately edits an answer.
+function qtiSourceChoiceEvidence(question){
+  if(!["multiple_choice_question","multiple_answers_question","true_false_question"].includes(question.type))return null;
+  const choices=(question.sourceEvents||[]).flatMap(e=>{
+    const m=String(e.text||"").match(/^\s*(\*?)\s*([A-H])\s*[.)]\s*(\*?)\s*(.+)$/is);
+    return m?[{label:m[2].toUpperCase(),correct:!!(m[1]||m[3]),text:m[4].trim(),recovered:!!e.sourceAutoChoiceRecovered}]:[];
+  });
+  if(choices.length<2)return null;
+  return {count:choices.length,choices,recovered:choices.filter(c=>c.recovered).length,
+    distinctLabels:[...new Set(choices.map(c=>c.label))].length};
+}
+
 function stripLeadingTextPrefix(html,prefixRx){
   const doc=new DOMParser().parseFromString(`<div id="qti-strip-prefix">${html}</div>`,"text/html");
   const root=doc.getElementById("qti-strip-prefix");
@@ -568,7 +700,11 @@ function stripLeadingTextPrefix(html,prefixRx){
 }
 function qtiCleanLine(value){return normalizeSpaces(textFromHtml(value));}
 function qtiQuestionStemCandidate(text){
-  const value=String(text||"").replace(/^\s*\d+\s*[.),]\s*/,"").trim();
+  const original=String(text||"").trim();
+  // PARSER-070: A/B/C/D options may contain question marks and "client".
+  // They are never question starts, even across Word page boundaries.
+  if(/^\*?\s*[a-h]\s*[.)]\s*\*?\s*\S/i.test(original))return false;
+  const value=original.replace(/^\s*\d+\s*[.),]\s*/,"").trim();
   return /^(?:match\b|select\b|place\b|using\b|which\b|what\b|how\b|identify\b|choose\b|complete\b|the client\b|a client\b|two clients\b|several clients\b|each of these\b|in the following\b)/i.test(value)
     || (/\?/.test(value) && /(?:client|medical|symptoms|substance|term|condition|structure|signs)/i.test(value));
 }
@@ -1010,6 +1146,16 @@ function qtiParseOrderedAnswerDropdowns(q,records,addIssue){
   return true;
 }
 
+function directTermDefinitionPair(event){
+  const text=String(event.text||"").trim();
+  const m=text.match(/^(.{2,70}?)\s*[-–—]\s*(.{9,})$/s);
+  if(!m || /^(?:Correct|Options|Question|Feedback|Match|Set feedback)\b/i.test(m[1]))return null;
+  const term=m[1].trim(),definition=m[2].trim();
+  if(!/^[A-Za-z][A-Za-z\s]{1,45}$/.test(term))return null;
+  // 'Dilutio' + unbold 'n' becomes the complete 'Dilution'.
+  return {left:term,right:definition};
+}
+function directTermDefinitionCount(events){return (events||[]).filter(e=>directTermDefinitionPair(e)).length;}
 function qtiCompileQuestion(q,body,bank){
   const texts=body.map(e=>e.text);
   const all=texts.join("\n");
@@ -1040,6 +1186,17 @@ function qtiCompileQuestion(q,body,bank){
   // Record answer-bearing IST instructions before hiding them from student view.
   for(const e of body) if(isTeacher(e.text))q.internalNotes.push(e.text);
 
+  // PARSER-063: three independent 'Match the following terms with their definitions'
+  // questions containing bold term–definition lines, without a table or key.
+  if(/^\s*Match\s+the\s+following\s+terms\s+with\s+their\s+definitions/i.test(textFromHtml(q.stem))){
+    const pairs=records.map(directTermDefinitionPair).filter(Boolean);
+    if(pairs.length>=2){
+      q.type="matching_question";q.pairs=pairs;q.distractors=[];
+      q.stem=`<p>${esc(textFromHtml(q.stem))}</p>`;
+      if(pairs.length!==3)addIssue(`Source term-definition block contains ${pairs.length} pairs; please verify the intended number.`,"review");
+      return;
+    }
+  }
   // 1. Sequencing exercise: the IST list is an answer key, not a question list.
   if(hasOrdering){
     q.type="matching_question";
@@ -1342,6 +1499,135 @@ function qtiIndependentMcQuestionCount(records){
   }
   return candidates.length;
 }
+// ---------------------------------------------------------------------------
+// v3.17 additions. Every function below is a NEW recognition or validation
+// path; none of them replaces an existing parser branch.
+// ---------------------------------------------------------------------------
+const QTI_EXPLICIT_OPENING=/^(?:select|match|place|which|what|how|identify|choose|complete|using|a client|the client|two clients|several clients|each of these|in the following)\b/i;
+// PARSER-072: "*d. ...included? 3. What action supports...?" in ONE paragraph.
+// Split only when (1) the line is a lettered answer option, (2) the embedded
+// number follows sentence punctuation and equals the next expected question
+// number, and (3) the remainder is shaped like a question. Options such as
+// "d. 10 -itis", "b. Give 2. 5 mg" or "c. See step 7. What next?" never match.
+function qtiSplitFusedQuestionEvent(event,expectedNumber){
+  if(!event || event.kind==="table")return null;
+  if(!/^\s*\*?\s*[A-H]\s*[.)]\s*\*?\s*\S/i.test(event.text||""))return null;
+  if(!/[.?!…]\s*\d{1,2}\s*[.)]\s+\S/.test(event.text||""))return null;
+  const doc=new DOMParser().parseFromString(`<div id="qti-fused">${event.html}</div>`,"text/html");
+  const root=doc.getElementById("qti-fused");
+  const raw=root.textContent||"";
+  const rx=/([.?!…])(\s*)(\d{1,2})\s*[.)]\s+(?=\S)/g;
+  let match,at=-1;
+  while((match=rx.exec(raw))){
+    if(Number(match[3])!==expectedNumber)continue;
+    const start=match.index+match[1].length+match[2].length;
+    const value=raw.slice(start).replace(/^\d{1,2}\s*[.)]\s+/,"").trim();
+    if(QTI_EXPLICIT_OPENING.test(value) || (/\?\s*$/.test(value) && value.length>=12)){at=start;break;}
+  }
+  if(at<0)return null;
+  const walker=doc.createTreeWalker(root,4);
+  let node,remaining=at,target=null;
+  while((node=walker.nextNode())){
+    const length=(node.nodeValue||"").length;
+    if(remaining<=length){target=node;break;}
+    remaining-=length;
+  }
+  if(!target)return null;
+  const range=doc.createRange();
+  range.setStart(target,remaining);range.setEnd(root,root.childNodes.length);
+  const tail=doc.createElement("div");
+  tail.appendChild(range.extractContents());
+  const tidy=el=>{
+    for(const child of [...el.querySelectorAll("*")].reverse())
+      if(!child.textContent.trim() && !/^(?:IMG|BR)$/.test(child.tagName) && !child.querySelector("img"))child.remove();
+    return el.innerHTML.trim();
+  };
+  const headHtml=tidy(root),tailHtml=tidy(tail);
+  const plain=html=>String(textFromHtml(html)).replace(/\s+/g," ").trim();
+  if(!plain(headHtml) || !plain(tailHtml))return null;
+  return [{...event,html:headHtml,text:plain(headHtml)},
+    {html:tailHtml,text:plain(tailHtml),kind:"text",fusedFromPreviousLine:true}];
+}
+// VALID-071: count lettered answer blocks. A block starts at each label "A"
+// and needs at least two options; other paragraphs (multi-paragraph options,
+// stems, feedback) do not open or close a block.
+function qtiAnswerBlockCount(records){
+  let blocks=0,size=0;
+  const close=()=>{if(size>=2)blocks++;size=0;};
+  for(const record of records||[]){
+    if(record.kind==="table")continue;
+    const label=String(record.text||"").match(/^\s*\*?\s*([A-H])\s*[.)]\s*\*?\s*\S/i);
+    if(!label)continue;
+    if(label[1].toUpperCase()==="A"){close();size=1;}
+    else if(size>0)size++;
+  }
+  close();
+  return blocks;
+}
+// An expected count is stated ONLY for banks made entirely of Multiple Choice /
+// Multiple Answers questions with their own lettered options. For Matching,
+// Multiple Dropdowns, tables and shared answer pools the source structure does
+// not give a reliable independent count, so none is invented.
+function qtiExpectedQuestionCount(group){
+  const records=group.sourceEvents||[];
+  const choiceOnly=group.questions.length>0 && group.questions.every(q=>
+    q.type==="multiple_choice_question"||q.type==="multiple_answers_question");
+  const pooled=records.some(r=>r.kind==="table" ||
+    /^(?:Options|Medical\s+Terms?|Meanings?|Combining\s+forms?|Suffixes?)\s*:/i.test(r.text||"") ||
+    /^IST\s*:\s*Correct\s+order/i.test(r.text||"") || /\[[^\]\n]*,[^\]\n]*\]/.test(r.text||""));
+  const blocks=group.sourceAnswerBlockCount||0;
+  if(!choiceOnly || pooled || !blocks)
+    return {count:null,basis:"Not determinable from the source structure (Matching, Multiple Dropdowns, tables, shared answer pools or no lettered options)."};
+  return {count:Math.max(blocks,group.independentMcQuestionCount||0),
+    basis:"Lettered answer blocks and numbered questions counted in the Word source."};
+}
+// Questions that came from this bank's source (wherever they were moved), and
+// questions added by hand inside the bank.
+function qtiLiveQuestionCounts(group){
+  const all=state.groups.includes(group)?state.groups.flatMap(g=>g.questions):group.questions;
+  return {fromSource:all.filter(q=>q.originBankId===group.id).length,
+    deletedFromSource:group.manuallyDeletedSourceCount||0,
+    addedHere:group.questions.filter(q=>!q.originBankId).length};
+}
+// VALID-074 (completes VALID-070-H): checks that the answer structure belongs
+// to ONE question. These are flags for a person to resolve, never auto-fixes.
+function qtiAnswerContinuityIssues(q){
+  if(q.type!=="multiple_choice_question" && q.type!=="multiple_answers_question")return;
+  const labels=(q.choices||[]).map(c=>String(c.label||"").toUpperCase()).filter(Boolean);
+  if(new Set(labels).size!==labels.length)
+    q.parseIssues.push({level:"correction",code:"merged_answer_blocks",
+      text:"Answer option labels repeat inside this question (for example A-D followed by A-D). Two source questions may have been merged. Separate them or remove the extra options before export."});
+  const embedded=/[.?!…]\s+\d{1,2}\s*[.)]\s+(?:which|what|how|select|identify|choose|match|complete|place|using|a client|the client)\b/i;
+  const stemLike=text=>text.length>=20 && /[?:]\s*$/.test(text);
+  const suspicious=(q.choices||[]).some(choice=>{
+    const parts=String(choice.html||"").split(/<br\s*\/?\s*>/i).map(part=>textFromHtml(part)).filter(Boolean);
+    return embedded.test(parts.join(" ")) || parts.slice(1).some(stemLike);
+  });
+  if(suspicious)
+    q.parseIssues.push({level:"review",code:"option_contains_question",
+      text:"An answer option contains text that looks like a question stem. Check whether another question was absorbed into this option."});
+  if(/(?:^|\s)\*?a\s*[.)]\s+\S.*\s\*?b\s*[.)]\s+\S.*\s\*?c\s*[.)]\s+\S/i.test(textFromHtml(q.stem||"")))
+    q.parseIssues.push({level:"review",code:"stem_contains_answer_labels",
+      text:"The question stem contains answer labels (a., b., c.). The answer choices may not have been separated from the stem."});
+}
+// UI-076: dropdown options stored in the pre-v3.16 formats (one comma-separated
+// string with * marking the correct answer, or a list of such strings) are
+// converted to option rows without losing text, order or the correct answer.
+function normalizeLegacyDropdownOptions(question){
+  for(const blank of question.blanks||[]){
+    if(typeof blank.options==="string")blank.options=parseDropdownOptions(blank.options);
+    else if(blank.options==null && typeof blank.optionsText==="string")blank.options=parseDropdownOptions(blank.optionsText);
+    else if(Array.isArray(blank.options) && blank.options.some(option=>typeof option==="string"))
+      blank.options=blank.options.flatMap(option=>typeof option==="string"
+        ? (option.includes(",") ? parseDropdownOptions(option) :
+          [{text:option.replace(/^\s*\*+\s*/,"").trim(),correct:/^\s*\*/.test(option)}]) : [option]);
+    if(!Array.isArray(blank.options))blank.options=[];
+  }
+}
+// VALID-075: a review-level bank note the user has explicitly signed off.
+function bankIssueReviewed(group,issue){
+  return (group.reviewedBankIssues||[]).includes(issue?.text||"");
+}
 function detectSourcePointsRule(html){
   const text=textFromHtml(String(html||"").replace(/<\/p>/gi,"</p>\n"));
   const match=text.match(/\bAll\s+questions\s+(?:are|worth|have)\s+(?:worth\s+)?(\d+(?:\.\d+)?)\s+points?\s+each\b/i) ||
@@ -1351,8 +1637,9 @@ function detectSourcePointsRule(html){
 }
 function parseHtmlToGroups(html,sourceName){
   const runId=++parseRunSequence;
-  const events=qtiSourceEvents(html);
-  const groupRx=/^(U\s*\d+)\s*[–—−-]\s*(L\s*\d+)\s*[–—−-]\s*Group\s*#?\s*(\d+)\s*[:–—−-]\s*(.+)$/i;
+  const events=qtiRecoverAutoLetteredOptions(qtiSourceEvents(html));
+  // PARSER-062: allow missing colon/dash after the Group number (Group 2 What is Oxidized).
+  const groupRx=/^(U\s*\d+)\s*[–—−-]\s*(L\s*\d+)\s*[–—−-]\s*Group\s*#?\s*(\d+)(?:\s*[:–—−-]\s*|\s+)(.+)$/i;
   const groups=[];
   let bank=null,current=null,questionSerial=0,feedbackMode=false,skipReferences=false;
   let pendingCaseIntro=[];
@@ -1361,11 +1648,22 @@ function parseHtmlToGroups(html,sourceName){
   const finishQuestion=()=>{
     if(!bank||!current)return;
     qtiCompileQuestion(current,current.sourceEvents,bank);
-    current.stem=normalizeQuestionStemHtml(removeAnswerKeyFromStem(current.stem));
+    current.stem=normalizeQuestionStemHtml(normalizeChemicalEquationHtml(removeAnswerKeyFromStem(current.stem)));
+    // VALID-074: answer continuity checks on the freshly parsed structure.
+    qtiAnswerContinuityIssues(current);
+    current.sourceChoiceEvidence=qtiSourceChoiceEvidence(current);
     current.originalSnapshot=snapshotForUndo(current);
     bank.questions.push(current);current=null;
   };
-  for(const event of events){
+  // PARSER-072: events are consumed from a queue so that one Word paragraph
+  // holding "last option + next numbered question" can be split in place.
+  const queue=[...events];
+  for(let cursor=0;cursor<queue.length;cursor++){
+    let event=queue[cursor];
+    if(bank&&current){
+      const fused=qtiSplitFusedQuestionEvent(event,questionSerial+1);
+      if(fused){queue.splice(cursor,1,fused[0],fused[1]);event=fused[0];}
+    }
     const lineHeading=event.text.replace(/\u00a0/g," ").replace(/\s+/g," ").replace(/^#+\s*/,"").trim();
     const heading=(pendingHeading ? `${pendingHeading} ${lineHeading}` : lineHeading).trim();
     let title=groupRx.exec(heading);
@@ -1393,14 +1691,28 @@ function parseHtmlToGroups(html,sourceName){
     const text=event.text;
     if(dom.excludeReferences.checked&&/^References?\s*:?$/i.test(text)){skipReferences=true;continue;}
     if(skipReferences)continue;
-    if(/^(?:set|general)\s+feedback\s*[:–—-]?\s*$/i.test(text)){
+    // PARSER-065: Word sometimes prefixes a Set feedback paragraph with '7 -'.
+    const feedbackText=text.replace(/^\s*\d+\s*[-–—.)]\s*(?=(?:(?:Set|General)\s+)?Feedback\b)/i,"");
+    // Only a bank-level heading before its first question is group feedback.
+    // A Feedback: paragraph inside a question remains question-specific.
+    // PARSER-073: an explicit "Set feedback" / "General feedback" block is
+    // bank-level by definition, even when the author wrote it AFTER the
+    // questions. (v3.16 appended that text to the last answer choice.) A plain
+    // "Feedback:" inside a question is still question-specific, as before.
+    const trailingGroupFeedback=!!current && current.sourceEvents.length>0 &&
+      /^(?:set|general)\s+feedback\b/i.test(feedbackText);
+    if(trailingGroupFeedback && String(bank.feedback||"").trim() &&
+        !bank.parseIssues.some(i=>i.code==="multiple_group_feedback"))
+      bank.parseIssues.push({level:"review",code:"multiple_group_feedback",
+        text:"Set feedback appears more than once in this bank. Both parts were kept in Group Feedback; confirm the text."});
+    if((!current||trailingGroupFeedback) && /^(?:(?:set|general)\s+)?feedback\s*[:–—-]?\s*$/i.test(feedbackText)){
       bank.feedbackExpected=true;feedbackMode=true;continue;
     }
-    const feedbackInline=text.match(/^(?:set|general)\s+feedback\s*[:–—-]\s*(.+)$/i);
+    const feedbackInline=(!current||trailingGroupFeedback) ? feedbackText.match(/^(?:(?:set|general)\s+)?feedback\s*[:–—-]\s*(.+)$/i) : null;
     if(feedbackInline){
       bank.feedbackExpected=true;
       // Strip the source marker, but keep its bold/italic Word text runs.
-      const formatted=stripLeadingTextPrefix(event.html,/^\s*(?:Set|General)\s+Feedback\s*[:–—-]\s*/i);
+      const formatted=stripLeadingTextPrefix(event.html,/^\s*(?:\d+\s*[-–—.)]\s*)?(?:(?:Set|General)\s+)?Feedback\s*[:–—-]\s*/i);
       bank.feedback=[bank.feedback,formatted||esc(feedbackInline[1])].filter(Boolean).join("<br>");
       feedbackMode=true;continue;
     }
@@ -1452,7 +1764,11 @@ function parseHtmlToGroups(html,sourceName){
       /^(?:Combining\s+forms?|Suffixes?)\s*:\s*.*[A-H]\s*[.)]/i.test(e.text));
     const orderNoteAt=priorEvents.findIndex(e=>/^IST\s*:\s*Correct\s+order\s+and\s+terms/i.test(e.text));
     const priorHasOrderedTerms=orderNoteAt>=0 && priorEvents.slice(orderNoteAt+1).some(e=>!!qtiNumberedValue(e.text));
-    const previousQuestionCompleted=priorHasKey||priorHasChoices||priorHasDropdownOptions||priorHasOrderedTerms;
+    const precedingDirectPairs=directTermDefinitionCount(priorEvents);
+    const nextDirectMatching=!!numbered && /^Match\s+the\s+following\s+terms\s+with\s+their\s+definitions/i.test(numbered.value);
+    const directMatchingComplete=precedingDirectPairs>=2 && nextDirectMatching &&
+      /^Match\s+the\s+following\s+terms\s+with\s+their\s+definitions/i.test(textFromHtml(current?.stem||""));
+    const previousQuestionCompleted=priorHasKey||priorHasChoices||priorHasDropdownOptions||priorHasOrderedTerms||directMatchingComplete;
     // Internal numbered descriptions and ordering terms have no completed
     // choice block before them, so they stay inside the current question.
     const meaningsAt=priorEvents.findIndex(e=>/^Meanings?\s*:/i.test(e.text));
@@ -1507,6 +1823,10 @@ function parseHtmlToGroups(html,sourceName){
       current=qtiNewQuestion(bank,++questionSerial,
         [...pendingCaseIntro,stem].filter(Boolean).join("<br>"));
       pendingCaseIntro=[];
+      current.originBankId=bank.id; // VALID-071: count source questions even after a move.
+      current.sourceSequenceNumber=numbered?.index??null;
+      if(event.fusedFromPreviousLine)current.internalNotes.push(
+        `Parser note: question ${numbered?numbered.index:questionSerial} was joined to the previous answer line in the Word source and was separated automatically.`);
       if(!numbered && questionSerial>1)current.parseIssues.push({level:"review",code:"question_boundary",text:"Unnumbered question boundary identified from the question text. Confirm the split."});
       continue;
     }
@@ -1515,6 +1835,23 @@ function parseHtmlToGroups(html,sourceName){
     if(text.length>3)bank.parseIssues.push({level:"review",text:`Content before first question was not classified: ${text.slice(0,120)}`});
   }
   finishQuestion();
+  // PARSER-083: An omitted source number is not ambiguous when the surrounding
+  // numbered questions prove its position AND it has a complete independent
+  // answer block. Leave other unnumbered questions for manual review.
+  for(const g of groups){
+    for(let i=1;i<g.questions.length-1;i++){
+      const question=g.questions[i],prior=g.questions[i-1],next=g.questions[i+1];
+      if(question.sourceSequenceNumber!=null ||
+         prior.sourceSequenceNumber!==i || next.sourceSequenceNumber!==i+2)continue;
+      if(![prior,question,next].every(q=>q.sourceChoiceEvidence?.count>=2 &&
+          q.choices?.length===q.sourceChoiceEvidence.count &&
+          q.choices.some(c=>c.correct) &&
+          new Set(q.choices.map(c=>c.label)).size===q.choices.length))continue;
+      question.parseIssues=question.parseIssues.filter(x=>x.code!=="question_boundary");
+      question.sourceSequenceInferred=i+1;
+      question.internalNotes.push(`Parser note: source question number ${i+1} was omitted; the independent answer block and neighboring numbered questions establish its position.`);
+    }
+  }
   // Independently count numbered MC openings with their OWN lettered choices.
   // A missed first question must not be hidden by subsequent Good questions.
   for(const g of groups){
@@ -1529,6 +1866,21 @@ function parseHtmlToGroups(html,sourceName){
       g.parseIssues.push({level:"correction",code:"possible_question_merge",
         text:`Possible question merge: ${g.sourceNumberedQuestionCount} numbered question openings were found, but only ${g.questions.length} question(s) were created.`});
   }
+  // VALID-071: an expected question count that does NOT depend on the
+  // boundary decisions above, so over-splits and merges can both be detected.
+  for(const g of groups){
+    g.sourceAnswerBlockCount=qtiAnswerBlockCount(g.sourceEvents||[]);
+    const expectation=qtiExpectedQuestionCount(g);
+    g.expectedQuestionCount=expectation.count;g.expectedQuestionBasis=expectation.basis;
+  }
+  // PARSER-073: a plain "Feedback:" after the LAST question only may be meant
+  // for the whole bank. Never guess: keep it on the question and ask.
+  for(const g of groups){
+    if(g.questions.length<2 || textFromHtml(g.feedback||""))continue;
+    const hasFeedbackLine=q=>(q.sourceEvents||[]).some(e=>/^\s*Feedback\s*[:–—-]/i.test(e.text));
+    if(hasFeedbackLine(g.questions[g.questions.length-1]) && !g.questions.slice(0,-1).some(hasFeedbackLine))
+      g.trailingFeedbackCandidate=true;
+  }
   // A missing/empty group must remain visible with a critical warning; do not
   // make it disappear from Step 2 solely because it contains no questions.
   const numberingSets=new Map();
@@ -1540,7 +1892,7 @@ function parseHtmlToGroups(html,sourceName){
   for(const siblings of numberingSets.values()){
     const nums=[...new Set(siblings.map(g=>g.number))].sort((a,b)=>a-b);
     for(let n=nums[0]+1;n<nums[nums.length-1];n++)if(!nums.includes(n)){
-      siblings[0].parseIssues.push({level:"review",text:`Group numbering gap: Group ${n} was not detected in ${siblings[0].unit} ${siblings[0].lesson}. Check the source.`});
+      siblings[0].parseIssues.push({level:"review",code:"group_numbering_gap",text:`Group numbering gap: Group ${n} was not detected in ${siblings[0].unit} ${siblings[0].lesson}. Check the source.`});
     }
   }
   if(pendingHeading)unmatchedHeadings.push(pendingHeading);
@@ -1607,7 +1959,26 @@ function generalFeedbackHtml(question, group) {
     .filter(Boolean).map(html=>removeAnswerKeyFromStem(html)).filter(Boolean).join("<br><br>");
 }
 
+// VALID-075: numbering gaps are recalculated from the current groups, so the
+// warning clears once groups are created, moved or renumbered.
+function recomputeNumberingGaps(){
+  const sets=new Map();
+  for(const group of state.groups){
+    group.liveNumberingGaps=[];
+    if(isDiagnosticGroup(group))continue;
+    const key=`${group.sourceName}|${group.unit}|${group.lesson}`;
+    if(!sets.has(key))sets.set(key,[]);
+    sets.get(key).push(group);
+  }
+  for(const siblings of sets.values()){
+    const nums=[...new Set(siblings.map(g=>g.number))].sort((a,b)=>a-b);
+    for(let n=nums[0]+1;n<nums[nums.length-1];n++)if(!nums.includes(n))
+      siblings[0].liveNumberingGaps.push({level:"review",code:"group_numbering_gap",
+        text:`Group numbering gap: Group ${n} was not detected in ${siblings[0].unit} ${siblings[0].lesson}. Check the source.`});
+  }
+}
 function revalidateAll() {
+  recomputeNumberingGaps();
   state.groups.forEach(group => {
     group.questions.forEach((question, index) => validateQuestion(group, question, index));
     validateGroup(group);
@@ -1627,6 +1998,7 @@ function revalidateAll() {
 
 function validateQuestion(group, question, index) {
   question.index = index + 1;
+  normalizeLegacyDropdownOptions(question); // UI-076
   if (!question.customTitle) question.itemTitle = questionTitleFromGroupTitle(group.title, index + 1);
   // VALID-034: Manual sign-off resolves ONLY parser uncertainty. It must not
   // remove substantive errors (missing correct answers, malformed Matching,
@@ -1636,7 +2008,12 @@ function validateQuestion(group, question, index) {
   if (question.draft) question.issues.push({level:"review",text:"Draft saved. Review the question and select Save Changes when finished."});
   // Missing shared media is a dependency for ALL question types, not merely
   // Multiple Dropdowns. The answer key may be valid, but the exam is not ready.
-  if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || ""))
+  if(group.feedbackExpected && !String(group.feedback||"").trim())
+    question.issues.push({level:"review",code:"source_feedback_missing",text:"The Word source declares Set feedback, but no feedback was imported for this question."});
+  if((group.parseIssues||[]).some(i=>/Set feedback|General feedback/i.test(i.text||"") && /not classified|missing|unrecognized/i.test(i.text||"") &&
+      !(i.level==="review" && bankIssueReviewed(group,i))))
+    question.issues.push({level:"review",code:"source_feedback_unclassified",text:"Set feedback was found in the source but was not classified. Recover and verify the feedback."});
+  if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || "") && !hasQuestionImage(question))
     question.issues.push({level:"review",text:"Shared image is pending. Insert the verified labeled image before publishing."});
   if (unresolvedQuestionImageReference(question,group))
     question.issues.push({level:"review",code:"missing_question_image",text:"The source question refers to a picture or diagram, but no image was provided. Insert and verify the image before publishing."});
@@ -1658,6 +2035,43 @@ function validateQuestion(group, question, index) {
 
     if (question.choices.length < 2) {
       question.issues.push({ level: "correction", text: "Question has fewer than two answer choices." });
+    }
+    // VALID-070-H: An unusual source-label sequence (A/B/C/E) is a
+    // document-editor review, not necessarily a missing QTI answer choice.
+    // Keep all answer text and the established correct key intact.
+    const labels=question.choices.map(c=>String(c.label||"").toUpperCase());
+    if(labels.some((label,i)=>label!==String.fromCharCode(65+i))){
+      question.issues.push({level:"review",code:"choice_sequence_gap",
+        text:"Answer labels are not sequential (for example A/B/C/E). Verify the source labels without changing the correct answer."});
+    }
+    const sourceEvidence=question.sourceChoiceEvidence;
+    if(sourceEvidence && question.choices.length<sourceEvidence.count)
+      question.issues.push({level:"correction",code:"source_answer_options_missing",
+        text:`Word contains ${sourceEvidence.count} source answer options but only ${question.choices.length} remain in this question. Restore the missing options and remove any displaced option text from the stem.`});
+    // Do not accept numeric auto-list answer text left inside the question stem.
+    const unresolvedAuto=(question.sourceEvents||[]).some(e=>
+      e.kind==="numbered-list" && e.automaticNumbering &&
+      !qtiQuestionStemCandidate(e.text) &&
+      question.choices.length>0 && textFromHtml(question.stem).includes(e.text));
+    if(unresolvedAuto)
+      question.issues.push({level:"correction",code:"unresolved_auto_list_answer",
+        text:"A numbered Word-list entry remains in the question stem instead of the answer choices. Restore the original option structure."});
+    // Preserve original-source merged-block evidence through Save Changes.
+    // Re-labeling eight choices as A-H is not equivalent to splitting two items.
+    if(question.parseIssues?.some(i=>i.code==="merged_answer_blocks")){
+      const expected=group.expectedQuestionCount;
+      const firstBlock=question.sourceChoiceEvidence?.choices||[];
+      const nextA=firstBlock.findIndex((c,i)=>i>0&&c.label==="A");
+      const maxOptions=nextA>0?nextA:4;
+      const structurallyRepaired=question.choices.length<=maxOptions &&
+        expected!=null && group.questions.length>=expected &&
+        question.choices.length>=2 && !/\b\d+\s*[.)]\s+(?:which|what|how|select|identify)\b/i.test(textFromHtml(question.stem));
+      if(structurallyRepaired)
+        question.issues=question.issues.filter(i=>i.code!=="merged_answer_blocks");
+    }
+    if(question.choices.some(c=>!textFromHtml(c.html).trim())){
+      question.issues.push({level:"correction",code:"empty_answer_choice",
+        text:"One or more answer choices have empty text."});
     }
 
     if (type === "true_false_question") {
@@ -1696,6 +2110,7 @@ function validateQuestion(group, question, index) {
       unique.add(blank.id);
       if (!question.stem.includes(`[${blank.id}]`)) question.issues.push({level:"correction",text:`Stem is missing the [${blank.id}] placeholder.`});
       if ((blank.options||[]).length < 2) question.issues.push({level:"correction",text:`Dropdown ${blank.id} has fewer than 2 options.`});
+      if ((blank.options||[]).some(o=>!String(o.text||"").trim())) question.issues.push({level:"correction",text:`Dropdown ${blank.id} has an empty answer option.`});
       const correct=(blank.options||[]).filter(o=>o.correct);
       if (correct.length !== 1) question.issues.push({level:"correction",text:`Dropdown ${blank.id} requires exactly one correct option (found ${correct.length}).`});
       if (new Set((blank.options||[]).map(o=>o.text.toLowerCase().trim())).size !== (blank.options||[]).length) question.issues.push({level:"correction",text:`Dropdown ${blank.id} contains duplicate options.`});
@@ -1727,11 +2142,53 @@ function validateQuestion(group, question, index) {
 }
 
 function validateGroup(group) {
-  group.issues = [...(group.parseIssues || [])];
-  if(group.feedbackExpected && !group.feedback.trim())group.issues.push({level:"correction",text:"The source declares Set Feedback, but its content was not imported."});
+  // VALID-075 / VALID-071: issues that depend on the CURRENT bank contents are
+  // recalculated here instead of staying frozen from import time. Their text
+  // and level at import are unchanged from v3.16.
+  const liveCodes=new Set(["missing_source_questions","possible_question_merge","group_numbering_gap"]);
+  const waivable=[];
+  const addWaivable=issue=>{waivable.push(issue);if(!bankIssueReviewed(group,issue))group.issues.push(issue);};
+  group.issues=[];
+  for(const issue of group.parseIssues||[]){
+    if(liveCodes.has(issue.code))continue;
+    if(issue.level==="review")addWaivable(issue);else group.issues.push(issue);
+  }
+  for(const issue of group.liveNumberingGaps||[])addWaivable(issue);
+  const counts=qtiLiveQuestionCounts(group);
+  // Questions intentionally deleted by the instructor are recorded separately
+  // and must not be mistaken for original DOCX extraction losses.
+  const sourceAccounted=counts.fromSource+counts.deletedFromSource;
+  const present=sourceAccounted+counts.addedHere;
+  let underReported=false;
+  if((group.independentMcQuestionCount||0)>=2 && present<group.independentMcQuestionCount){
+    underReported=true;
+    group.issues.push({level:"correction",code:"missing_source_questions",
+      text:`Some questions may be missing: the document contains at least ${group.independentMcQuestionCount} numbered questions with answer options, but only ${present} were imported.`});
+  }
+  if((group.sourceNumberedQuestionCount||0)>=2 && present<group.sourceNumberedQuestionCount){
+    underReported=true;
+    group.issues.push({level:"correction",code:"possible_question_merge",
+      text:`Possible question merge: ${group.sourceNumberedQuestionCount} numbered question openings were found, but only ${present} question(s) were created.`});
+  }
+  if(group.expectedQuestionCount!=null){
+    const expected=group.expectedQuestionCount;
+    if(sourceAccounted>expected)
+      group.issues.push({level:"correction",code:"possible_question_split",
+        text:`Possible segmentation error: the Word source shows ${expected} question(s) with answer options in this bank, but ${sourceAccounted} source question(s) were recovered or explicitly deleted. Repair the split rather than confirming this as a review note.`});
+    else if(sourceAccounted<expected && !underReported)
+      group.issues.push({level:"correction",code:"question_count_mismatch",
+        text:`Possible merged or missing source question: the Word source shows ${expected} answer block(s) in this bank, but only ${sourceAccounted} source question(s) are accounted for. Moving questions between banks does not alter their source ownership.`});
+  }
+  if(group.trailingFeedbackCandidate && !textFromHtml(group.feedback||""))
+    addWaivable({level:"review",code:"trailing_feedback_ambiguous",
+      text:"A Feedback paragraph follows the last question of this bank and was kept as that question's feedback. If it is Group Feedback for the whole bank, move it to the Group feedback field."});
+  group.waivableIssues=waivable;
+  if(group.feedbackExpected && !group.feedback.trim())group.issues.push({level:"review",code:"source_feedback_missing",text:"The source declares Set Feedback, but its content was not imported."});
   if(group.feedbackImagePending && !canonicalCdnImageUrl(group.feedbackImageUrl || ""))
     group.issues.push({level:"review",text:"The feedback image is pending. Add the verified image before publishing."});
-  if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || "")) group.issues.push({level:"review",text:"Shared labeled image requested by IST; LXD placeholder is not yet replaced."});
+  if (group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || "") &&
+      !group.questions.every(question=>hasQuestionImage(question)))
+    group.issues.push({level:"review",text:"A shared image was requested; one or more questions still lack an embedded image or a verified shared image URL."});
   const qPerSet = Number(dom.questionsPerSet.value || 0);
   if (qPerSet && group.questions.length !== qPerSet) {
     group.issues.push({ level: "review", text: `Expected ${qPerSet} question(s), but found ${group.questions.length}.` });
@@ -1759,6 +2216,9 @@ function friendlyValidationMessage(raw) {
   const issue=typeof raw==="string"?{text:raw}:raw||{};
   const text=String(issue.text||"");
   const lower=text.toLowerCase();
+  // v3.17 messages are already written for the reviewer; show them verbatim.
+  if(/^(?:Possible segmentation error|Possible merged or missing question|A Feedback paragraph follows|Answer option labels repeat|An answer option contains text|The question stem contains answer labels|Set feedback appears more than once)/.test(text))
+    return text;
   if(issue.code==="question_boundary" || /unnumbered question boundary|confirm the split/.test(lower))
     return "We couldn't confirm where this question starts or ends. Please review the question.";
   if(/missing lettered|medical terms answer choices|no labeled matching options/.test(lower))
@@ -1788,6 +2248,7 @@ function isManualReviewIssue(issue){
   if(!issue || issue.level!=="review")return false;
   return isBoundaryReviewIssue(issue) || issue.code==="question_boundary_ambiguous" ||
     issue.code==="format_based_answer" ||
+    issue.code==="option_contains_question" || issue.code==="stem_contains_answer_labels" ||
     /no explicit answer key or structural table header|confirm that each table row is a correct direct pair/i.test(issue.text||"");
 }
 function hasManualReviewIssue(question){
@@ -1804,7 +2265,8 @@ function reconcileManualParserIssues(question,structureChanged) {
   question.parseIssues=(question.parseIssues||[]).filter(issue=>{
     // A modified answer is not automatically a confirmed answer. Retain
     // parser review warnings until the user explicitly verifies the question.
-    if(isManualReviewIssue(issue))return true;
+    if(isManualReviewIssue(issue) || issue.code==="merged_answer_blocks" ||
+       issue.code==="source_answer_options_missing" || issue.code==="unresolved_auto_list_answer")return true;
     // Once a user has actually repaired all required answer fields, parser
     // diagnostics tied to the old answer structures are no longer current.
     return !/matching|description|correct answers|correct matches|option|answer.*key|unmatched|dropdown|blank/i.test(issue.text||"");
@@ -1836,11 +2298,35 @@ function issueTagsForQuestion(group,question){
   return tags;
 }
 function clearAllQuestionFilters(){
-  state.search="";state.filter="all";state.questionTypeFilter="all";
+  state.search="";state.filter="all";state.questionTypeFilter="all";state.unitFilter="all";state.lessonFilter="all";
   state.issueFilter="all";state.feedbackFilter="all";
-  dom.searchBox.value="";dom.questionTypeFilter.value="all";
+  dom.searchBox.value="";dom.questionTypeFilter.value="all";dom.unitFilter.value="all";dom.lessonFilter.value="all";
   document.querySelectorAll(".filter-card").forEach(el=>el.classList.toggle("active",el.dataset.filter==="all"));
   renderAll();
+}
+function renderDynamicFilters(){
+  const groups=state.groups.filter(g=>!isDiagnosticGroup(g));
+  const units=[...new Set(groups.map(g=>g.unit))].sort();
+  dom.unitFilter.innerHTML='<option value="all">All units</option>'+units.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  if(state.unitFilter!=="all"&&!units.includes(state.unitFilter))state.unitFilter="all";
+  dom.unitFilter.value=state.unitFilter;
+  const lessonGroups=groups.filter(g=>state.unitFilter==="all"||g.unit===state.unitFilter);
+  const lessons=[...new Set(lessonGroups.map(g=>g.lesson))].sort((a,b)=>Number(a.slice(1))-Number(b.slice(1)));
+  dom.lessonFilter.innerHTML='<option value="all">All lessons</option>'+lessons.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  if(state.lessonFilter!=="all"&&!lessons.includes(state.lessonFilter))state.lessonFilter="all";
+  dom.lessonFilter.value=state.lessonFilter;
+  const typeTotals=new Map();
+  groups.filter(g=>(state.unitFilter==="all"||g.unit===state.unitFilter)&&
+    (state.lessonFilter==="all"||g.lesson===state.lessonFilter)).forEach(g=>g.questions.forEach(q=>{
+      const type=questionCategory(q);typeTotals.set(type,(typeTotals.get(type)||0)+1);
+    }));
+  const typeNames={multiple_choice:"Multiple Choice",multiple_answers:"Multiple Answers",
+    multiple_choice_images:"Multiple Choice with Images",matching:"Matching",multiple_dropdowns:"Multiple Dropdowns",true_false:"True / False"};
+  dom.questionTypeFilter.innerHTML='<option value="all">All question types ('+[...typeTotals.values()].reduce((a,b)=>a+b,0)+')</option>'+
+    Object.entries(typeNames).filter(([id])=>typeTotals.get(id)).map(([id,label])=>
+      `<option value="${id}">${label} (${typeTotals.get(id)})</option>`).join("");
+  if(state.questionTypeFilter!=="all"&&!typeTotals.has(state.questionTypeFilter))state.questionTypeFilter="all";
+  dom.questionTypeFilter.value=state.questionTypeFilter;
 }
 function renderIssueFilterBars(){
   const questions=state.groups.flatMap(g=>g.questions.map(q=>({g,q})));
@@ -1870,23 +2356,49 @@ function matchesSearch(group, question) {
   return content.includes(state.search);
 }
 function matchesFilters(group, question) {
-  return (state.filter === "all" || question.status === state.filter) &&
+  return (state.unitFilter==="all"||group.unit===state.unitFilter) &&
+    (state.lessonFilter==="all"||group.lesson===state.lessonFilter) &&
+    (state.filter === "all" || question.status === state.filter) &&
     (state.questionTypeFilter === "all" || questionCategory(question) === state.questionTypeFilter) &&
     (state.issueFilter === "all" || issueTagsForQuestion(group,question).has(state.issueFilter)) &&
     (state.feedbackFilter !== "no_feedback" || !generalFeedbackHtml(question,group).trim()) &&
     matchesSearch(group, question);
 }
+// When a bank is flagged for review/correction, selecting its status must show
+// ALL questions inside the bank. A question's own status remains unchanged.
+// Granular type/issue/feedback filters continue to apply when explicitly set.
+function showEntireFlaggedBank(group){
+  return (state.filter==="review"||state.filter==="correction") && group.status===state.filter &&
+    state.issueFilter==="all" && state.questionTypeFilter==="all" && state.feedbackFilter==="all";
+}
+function visibleQuestionItems(group){
+  return group.questions.filter(q=>showEntireFlaggedBank(group)
+    ? matchesSearch(group,q)
+    : matchesFilters(group,q));
+}
 function visibleGroups() {
-  return state.groups.filter(group => !group.questions.length ? state.issueFilter === "all" && state.feedbackFilter !== "no_feedback" && state.filter === "all" && state.questionTypeFilter === "all" && matchesSearch(group,{itemTitle:"",stem:"",choices:[],pairs:[],blanks:[]}) : group.questions.some(question => matchesFilters(group,question)));
+  return state.groups.filter(group=>{
+    if(state.unitFilter!=="all"&&group.unit!==state.unitFilter)return false;
+    if(state.lessonFilter!=="all"&&group.lesson!==state.lessonFilter)return false;
+    // Structural bank-level errors must remain discoverable when filtering
+    // Needs Review / Needs Correction, even if every question is individually Good.
+    if(showEntireFlaggedBank(group))return !state.search ||
+      group.questions.some(q=>matchesSearch(group,q)) ||
+      matchesSearch(group,{itemTitle:"",stem:"",choices:[],pairs:[],blanks:[]});
+    if(!group.questions.length)return state.issueFilter==="all"&&state.feedbackFilter!=="no_feedback" &&
+      state.filter==="all"&&state.questionTypeFilter==="all"&&matchesSearch(group,{itemTitle:"",stem:"",choices:[],pairs:[],blanks:[]});
+    return visibleQuestionItems(group).length>0;
+  });
 }
 function filteredQuestions() {
   const groups = visibleGroups();
   const activeGroup = groups.find(g=>g.id===state.selectedBankId) || groups[0];
   if (!activeGroup) return {group:null,items:[]};
-  return {group:activeGroup,items:activeGroup.questions.filter(q=>matchesFilters(activeGroup,q))};
+  return {group:activeGroup,items:visibleQuestionItems(activeGroup)};
 }
 
 function renderAll() {
+  renderDynamicFilters();
   renderIssueFilterBars();
   renderCounts();
   renderBankList();
@@ -1904,7 +2416,7 @@ function renderSummaryOverview() {
   const corrected=questions.filter(q=>q.status==="correction").length;
   const review=questions.filter(q=>q.status==="review").length;
   const groupsWithErrors=state.groups.filter(g=>g.status==="correction").length;
-  dom.setupBankCount.textContent=state.groups.length;
+  dom.setupBankCount.textContent=state.groups.filter(g=>!isDiagnosticGroup(g)).length;
   dom.setupQuestionCount.textContent=questions.length;
   const defaultPoints=Number(dom.defaultPoints.value || 0);
   const points=questions.reduce((sum,q)=>sum+Number(q.points || defaultPoints),0);
@@ -1939,7 +2451,9 @@ function renderCounts() {
   dom.countGood.textContent = counts.good;
   dom.countReview.textContent = counts.review;
   dom.countCorrection.textContent = counts.correction;
-  dom.bankCountPill.textContent = `${state.groups.length} bank${state.groups.length === 1 ? "" : "s"}`;
+  const academicBanks=state.groups.filter(g=>!isDiagnosticGroup(g)).length;
+  const diagnostics=state.groups.length-academicBanks;
+  dom.bankCountPill.textContent = `${academicBanks} bank${academicBanks===1?"":"s"}`+(diagnostics?` · ${diagnostics} source issue${diagnostics===1?"":"s"}`:"");
 
   const hasData = questions.length > 0;
   dom.validateBtn.disabled = !hasData;
@@ -1993,8 +2507,16 @@ function renderBankList() {
   dom.bankList.innerHTML = groups.map(group => `
     <div class="bank-card ${group.id === state.selectedBankId ? "active" : ""}" data-bank-id="${group.id}">
       <div class="bank-card-title">${esc(group.unit)} – ${esc(group.lesson)} – Group ${group.number}: ${esc(group.title)}</div>
-      <div class="bank-card-meta">${group.questions.filter(q=>matchesFilters(group,q)).length} of ${group.questions.length} shown · ${esc(group.sourceName)}</div>
+      <div class="bank-card-meta">${visibleQuestionItems(group).length} of ${group.questions.length} shown · ${esc(group.sourceName)}</div>
+      ${!isDiagnosticGroup(group)?`<div class="bank-manage-actions">
+        <button type="button" class="small-btn" data-edit-group="${esc(group.id)}">Edit Group</button>
+        <button type="button" class="small-btn" data-reorder-group="up" data-bank-action-id="${esc(group.id)}" aria-label="Move group up">↑</button>
+        <button type="button" class="small-btn" data-reorder-group="down" data-bank-action-id="${esc(group.id)}" aria-label="Move group down">↓</button>
+        ${group.questions.length===0?`<button type="button" class="small-btn danger-action" data-delete-empty-group="${esc(group.id)}">Delete Empty</button>`:""}
+      </div>`:""}
       ${bankBadgeMarkup(group)}
+      ${(group.issues||[]).filter(i=>!/ contains critical issues\.$| needs review\.$/.test(i.text||"")).length ?
+        `<div class="bank-structural-issues"><strong>Bank Issues (${(group.issues||[]).filter(i=>!/ contains critical issues\.$| needs review\.$/.test(i.text||"")).length})</strong>${(group.issues||[]).filter(i=>!/ contains critical issues\.$| needs review\.$/.test(i.text||"")).slice(0,2).map(i=>`<p>${esc(friendlyValidationMessage(i))}</p>`).join("")}</div>` : ""}
       <div class="bank-issue-counts">${ISSUE_TAGS.map(t=>{
         const n=group.questions.filter(q=>issueTagsForQuestion(group,q).has(t.id)).length;
         return n?`<span class="bank-issue-chip">${esc(t.label)} ${n}</span>`:"";
@@ -2003,12 +2525,19 @@ function renderBankList() {
   `).join("");
 
   dom.bankList.querySelectorAll("[data-bank-id]").forEach(card => {
-    card.addEventListener("click", () => {
+    card.addEventListener("click", (event) => {
+      const manage=event.target.closest("[data-edit-group], [data-reorder-group], [data-delete-empty-group]");
+      if(manage){
+        event.stopPropagation();
+        if(manage.dataset.editGroup)openGroupEditor("edit",manage.dataset.editGroup);
+        else if(manage.dataset.deleteEmptyGroup)deleteEmptyGroup(manage.dataset.deleteEmptyGroup);
+        else reorderGroup(manage.dataset.bankActionId,manage.dataset.reorderGroup);
+        return;
+      }
       if(!confirmLeaveUnsavedEditor())return;
       state.selectedBankId = card.dataset.bankId;
       const targetGroup = state.groups.find(group => group.id === state.selectedBankId);
-      // Select the first question that satisfies the active filters.
-      state.selectedQuestionId = targetGroup?.questions.find(q => matchesFilters(targetGroup, q))?.id || null;
+      state.selectedQuestionId = visibleQuestionItems(targetGroup)[0]?.id || null;
       renderAll();
     });
   });
@@ -2022,8 +2551,10 @@ function renderQuestionList() {
     return;
   }
   if (!items.length) {
-    state.selectedQuestionId = null;
-    dom.questionList.innerHTML = `<div class="empty-state">No questions match the selected filters.</div>`;
+    state.selectedQuestionId=null;
+    const statusOnly=(state.filter==="review"||state.filter==="correction") && group.status===state.filter;
+    dom.questionList.innerHTML=statusOnly?`<div class="bank-structural-issues"><strong>Bank-level ${state.filter==="review"?"review":"correction"} issue — no individual questions flagged</strong>${(group.issues||[]).filter(i=>!/ contains critical issues\.$| needs review\.$/.test(i.text||"")).map(i=>`<p>${esc(friendlyValidationMessage(i))}</p>`).join("")}</div>`:
+      `<div class="empty-state">No questions match the selected filters.</div>`;
     return;
   }
 
@@ -2031,7 +2562,11 @@ function renderQuestionList() {
     state.selectedQuestionId = items[0]?.id || null;
   }
 
-  dom.questionList.innerHTML = items.map(question => `
+  const bankIssueBanner=(group.status!=="good" && (group.issues||[]).some(i=>
+    !/ contains critical issues\.$| needs review\.$/.test(i.text||""))) ?
+    `<div class="bank-structural-issues"><strong>Bank issues (${group.status==="review"?"Review":"Correction"})</strong>${(group.issues||[])
+      .filter(i=>!/ contains critical issues\.$| needs review\.$/.test(i.text||"")).map(i=>`<p>${esc(friendlyValidationMessage(i))}</p>`).join("")}</div>`:"";
+  dom.questionList.innerHTML = bankIssueBanner + items.map(question => `
     <div class="question-card ${question.id === state.selectedQuestionId ? "selected" : ""}" data-question-id="${esc(question.id)}" tabindex="0" aria-label="Select ${esc(question.itemTitle)}" aria-current="${question.id === state.selectedQuestionId ? "true" : "false"}">
       <div class="question-card-header">
         <div>
@@ -2046,6 +2581,8 @@ function renderQuestionList() {
       ${question.issues.length ? `<div class="issue-snippet">${esc(friendlyValidationMessage(question.issues[0]))}${question.issues.length > 1 ? ` (+${question.issues.length-1} more)` : ""}</div>` : ""}
 
       <div class="question-actions">
+        <label class="question-move-select"><input type="checkbox" data-select-question="${esc(question.id)}" ${state.selectedForMove.has(question.id)?"checked":""} aria-label="Select ${esc(question.itemTitle)} to move"> Select</label>
+        <button class="small-btn" data-move-to-group="${esc(question.id)}">Move to Group</button>
         <button class="small-btn" data-open="${question.id}">Edit</button>
         <button class="small-btn" data-preview="${question.id}">Preview</button>
         <button class="small-btn" data-move="up" data-id="${question.id}" title="Move up" aria-label="Move ${esc(question.itemTitle)} up">↑</button>
@@ -2068,7 +2605,7 @@ function selectQuestion(questionId, tab = null) {
   const question = byId(questionId);
   if (!question) return;
   const group = state.groups.find(g => g.id === question.groupId);
-  if (!group || !matchesFilters(group, question)) return;
+  if (!group || !filteredQuestions().items.some(q=>q.id===question.id)) return;
   if(questionId!==state.selectedQuestionId && !confirmLeaveUnsavedEditor())return;
   state.selectedBankId = group.id;
   state.selectedQuestionId = question.id;
@@ -2084,6 +2621,14 @@ function selectQuestion(questionId, tab = null) {
 }
 
 dom.questionList.addEventListener("click", event => {
+  const selection=event.target.closest("input[data-select-question]");
+  if(selection){
+    if(selection.checked)state.selectedForMove.add(selection.dataset.selectQuestion);
+    else state.selectedForMove.delete(selection.dataset.selectQuestion);
+    return;
+  }
+  const transfer=event.target.closest("button[data-move-to-group]");
+  if(transfer){state.selectedForMove=new Set([transfer.dataset.moveToGroup]);openQuestionMoveDialog();return;}
   const move=event.target.closest("button[data-move]");
   const duplicate=event.target.closest("button[data-duplicate]");
   const remove=event.target.closest("button[data-remove]");
@@ -2096,6 +2641,7 @@ dom.questionList.addEventListener("click", event => {
       button.dataset.preview ? "preview" : "editor");
     return;
   }
+  if(event.target.closest(".question-move-select"))return;
   const card = event.target.closest(".question-card[data-question-id]");
   if (card) selectQuestion(card.dataset.questionId);
 });
@@ -2222,10 +2768,48 @@ function formattingToolbar(fieldId){
     ["bold","B","Bold (select text first)"],
     ["italic","I","Italic (select text first)"],
     ["ul","• List","Bulleted list (select lines first)"],
-    ["ol","1. List","Numbered list (select lines first)"]
+    ["ol","1. List","Numbered list (select lines first)"],
+    ...(fieldId==="editStem"?[["image","▣ Image","Insert an embedded image URL at the cursor"]]:[])
   ];
   return `<div class="html-format-toolbar" role="toolbar" aria-label="HTML formatting tools">${actions.map(([action,label,title])=>
     `<button class="format-action format-${action}" type="button" data-format-action="${action}" data-format-field="${fieldId}" title="${esc(title)}" aria-label="${esc(title)}">${label}</button>`).join("")}</div>`;
+}
+function htmlListItemsFromSelection(selected){
+  const raw=selected.trim();
+  const doc=new DOMParser().parseFromString(`<div id="qti-selection">${raw}</div>`,"text/html");
+  const root=doc.getElementById("qti-selection");
+  const nodes=[...root.children];
+  if(nodes.length>0 && nodes.every(el=>["P","LI"].includes(el.tagName)) &&
+    [...root.childNodes].every(node=>node.nodeType===1 || !(node.textContent||"").trim()))
+    return nodes.map(el=>el.innerHTML.trim()).filter(Boolean);
+  return selected.replace(/<br\s*\/?>/gi,"\n").split(/\r?\n/).map(x=>x.trim()).filter(Boolean)
+    .map(x=>x.replace(/^<p[^>]*>/i,"").replace(/<\/p>$/i,""));
+}
+function validEditorImageUrl(value){
+  try{const url=new URL(String(value||"").trim());return url.protocol==="https:"&&
+    /\.(?:png|jpe?g|gif|webp|svg)$/i.test(url.pathname)?url.href:null;}
+  catch(_){return null;}
+}
+function insertImageAtCursor(textarea,url,alt){
+  const safe=validEditorImageUrl(url);
+  if(!safe)return false;
+  const insertion=`<img src="${esc(safe)}" alt="${esc(alt||"")}" width="640" />`;
+  textarea.setRangeText(insertion,textarea.selectionStart,textarea.selectionEnd,"end");
+  textarea.dispatchEvent(new Event("input",{bubbles:true}));textarea.focus();return true;
+}
+function openImageDialog(textarea){
+  const dialog=document.getElementById("insertImageDialog"),urlInput=document.getElementById("insertImageUrl"),altInput=document.getElementById("insertImageAlt");
+  const start=textarea.selectionStart,end=textarea.selectionEnd;
+  urlInput.value="";altInput.value="";
+  dialog.showModal();urlInput.focus();
+  document.getElementById("insertImageConfirm").onclick=()=>{
+    const value=validEditorImageUrl(urlInput.value);
+    if(!value){urlInput.setCustomValidity("Enter a valid HTTPS image URL ending in PNG, JPG, GIF, WebP or SVG.");urlInput.reportValidity();return;}
+    urlInput.setCustomValidity("");textarea.setSelectionRange(start,end);
+    insertImageAtCursor(textarea,value,altInput.value);dialog.close();
+  };
+  document.getElementById("insertImageCancel").onclick=()=>dialog.close();
+  urlInput.oninput=()=>urlInput.setCustomValidity("");
 }
 function formatSelectedHtmlField(textarea,action){
   const start=textarea.selectionStart,end=textarea.selectionEnd;
@@ -2242,7 +2826,7 @@ function formatSelectedHtmlField(textarea,action){
     const tag=action==="bold"?"strong":"em";
     replacement=`<${tag}>${selected}</${tag}>`;
   }else if(action==="ul"||action==="ol"){
-    const lines=selected.replace(/<br\s*\/?>/gi,"\n").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    const lines=htmlListItemsFromSelection(selected);
     if(!lines.length)return false;
     const li=lines.map(line=>`<li>${line.replace(/^<p[^>]*>/i,"").replace(/<\/p>$/i,"")}</li>`).join("\n");
     replacement=`<${action}>\n${li}\n</${action}>`;
@@ -2277,11 +2861,18 @@ function renderEditor() {
   let inputMarkup="";
   if(question.type==="multiple_dropdowns_question") {
     inputMarkup=`<div class="editor-group"><h3>Dropdown blanks</h3>
-      <p class="validation-help">Each blank needs a matching [blankId] in Stem HTML and exactly one correct option (mark it with *).</p>
+      <p class="validation-help">Each blank needs a [blankId] in Stem HTML. Choose exactly one correct answer using its radio button. Edit, add, or delete options individually.</p>
       ${(question.blanks||[]).map((b,i)=>`<div class="dropdown-editor-row"><div class="dropdown-editor-head"><strong>${esc(friendlyDropdownLabel(b,i))}</strong><small class="validation-help">Internal ID: ${esc(b.id)}</small><button type="button" class="small-btn" data-delete-blank="${i}">Delete</button></div>
         <label class="field"><span>Blank ID</span><input data-blank-id="${i}" value="${esc(b.id)}"></label>
         <label class="field"><span>Label / prompt</span><input data-blank-prompt="${i}" value="${esc(b.prompt)}"></label>
-        <label class="field"><span>Options (comma-separated; * marks correct)</span><textarea rows="2" data-blank-options="${i}">${esc(dropdownOptionsText(b.options))}</textarea></label>
+        <div class="dropdown-answer-options" role="group" aria-label="Answer options for ${esc(b.prompt||b.id)}">
+          ${(b.options||[]).map((o,j)=>`<div class="dropdown-answer-row">
+            <label class="dropdown-answer-radio"><input type="radio" name="dropdown_correct_${i}" data-dropdown-correct="${i}" value="${j}" ${o.correct?"checked":""} aria-label="Mark option ${j+1} correct"><span>${j+1}.</span></label>
+            <input type="text" data-dropdown-option="${i}" data-option-index="${j}" value="${esc(o.text)}" aria-label="Option ${j+1} text" placeholder="Answer option" />
+            <button type="button" class="icon-btn" data-delete-dropdown-option="${i}" data-option-index="${j}" aria-label="Delete option ${j+1}">Delete</button>
+          </div>`).join("")}
+          <button type="button" class="small-btn" data-add-dropdown-option="${i}">+ Add option</button>
+        </div>
       </div>`).join("")}
       <button class="small-btn" type="button" id="addBlankBtn">Add dropdown blank</button></div>`;
   } else if(["multiple_choice_question","multiple_answers_question","true_false_question"].includes(question.type)) {
@@ -2314,10 +2905,15 @@ function renderEditor() {
       ${question.type==="matching_question"?`<label class="field"><span>Matching explanations (one per line)</span><textarea id="editMatchingNotes" rows="4">${esc((question.matchingNotes||[]).map(x=>textFromHtml(x)).join("\n"))}</textarea></label>`:""}
       ${group.requiresImage?`<label class="field"><span>Shared image URL (student question stem)</span><input id="editSharedImage" type="url" placeholder="https://cdn-media..." value="${esc(group.imageUrl||"")}"></label>`:""}
       ${group.feedbackImagePending?`<label class="field"><span>Feedback image URL (optional, separate from the shared stem image)</span><input id="editFeedbackImage" type="url" placeholder="https://cdn-media..." value="${esc(group.feedbackImageUrl||"")}"></label>`:""}
-      ${group.teacherNotes?.length||question.internalNotes?.length?`<details><summary>Internal production notes (not exported)</summary>${[...(group.teacherNotes||[]),...(question.internalNotes||[])].map(t=>`<p>${esc(t)}</p>`).join("")}</details>`:""}
       <label class="field"><span>Group feedback (applied to every question)</span>${formattingToolbar("editGroupFeedback")}<textarea id="editGroupFeedback" rows="4">${esc(group.feedback||"")}</textarea></label>
     </div>
-    ${hasManualReviewIssue(question) && !question.reviewConfirmed ? `<label class="manual-review-confirm">
+    <div class="editor-group internal-notes-panel"><h3>Internal Notes (Not Exported)</h3>
+      <p class="validation-help">Word comments and instructor notes are for review only. They never appear in the student question or the QTI package.</p>
+      ${[...(group.teacherNotes||[]),...(question.internalNotes||[])].length?
+        [...(group.teacherNotes||[]),...(question.internalNotes||[])].map(t=>`<p class="internal-note-item">${esc(t)}</p>`).join(""):
+        '<p class="validation-help">No internal notes associated with this question or bank.</p>'}
+    </div>
+    ${false && hasManualReviewIssue(question) && !question.reviewConfirmed ? `<label class="manual-review-confirm">
       <input type="checkbox" id="confirmAnswersCheckbox" ${question.reviewConfirmed ? "checked" : ""}>
       <span><strong>Confirm Answers</strong><small>I have checked the question, its answer choices, and the correct answers. After Save Changes, mark it Good if validation passes.</small></span>
     </label>` : ""}
@@ -2338,7 +2934,7 @@ function renderEditor() {
     button.addEventListener("mousedown",event=>event.preventDefault());
     button.addEventListener("click",()=>{
       const target=dom.editorPanel.querySelector(`#${button.dataset.formatField}`);
-      if(target)formatSelectedHtmlField(target,button.dataset.formatAction);
+      if(target){if(button.dataset.formatAction==="image")openImageDialog(target);else formatSelectedHtmlField(target,button.dataset.formatAction);}
     });
   });
   editorBaselineFingerprint=editorFormFingerprint();
@@ -2364,7 +2960,9 @@ function renderEditor() {
     } else if(question.type==="multiple_dropdowns_question"){
       question.blanks=[...dom.editorPanel.querySelectorAll("[data-blank-id]")].map((input,i)=>({
         id:input.value.trim(),prompt:dom.editorPanel.querySelector(`[data-blank-prompt="${i}"]`)?.value.trim()||"",
-        options:parseDropdownOptions(dom.editorPanel.querySelector(`[data-blank-options="${i}"]`)?.value||"")
+        options:[...dom.editorPanel.querySelectorAll(`[data-dropdown-option="${i}"]`)].map((field,j)=>({
+          text:field.value.trim(),correct:!!dom.editorPanel.querySelector(`[data-dropdown-correct="${i}"][value="${j}"]`)?.checked
+        }))
       }));
     } else {
       question.choices=[...dom.editorPanel.querySelectorAll("[data-choice-text]")].map((input,i)=>({
@@ -2375,7 +2973,11 @@ function renderEditor() {
     }
   };
   const save=(draft=false,rerender=true)=>{
-    const substantive=q=>JSON.stringify([q.type,q.stem,q.choices,q.pairs,q.blanks]);
+    // Compare academic answer content, not presentation labels: readForm()
+    // reletters A/B/C even when the user clicked Save without editing. Such
+    // normalization is NOT evidence that a parser error was repaired.
+    const substantive=q=>JSON.stringify([q.type,
+      (q.choices||[]).map(c=>[textFromHtml(c.html),!!c.correct]),q.pairs,q.blanks]);
     const prior=substantive(question);
     const confirm=document.getElementById("confirmAnswersCheckbox");
     const confirmOnSave=Boolean(confirm?.checked);
@@ -2386,13 +2988,15 @@ function renderEditor() {
     // For edited content the user must explicitly check Confirm Answers again.
     if(changed && !confirmOnSave)question.reviewConfirmed=false;
     if(!draft){
-      if(hasManualReviewIssue(question) && confirm)question.reviewConfirmed=confirmOnSave;
+      // WORKFLOW-055: Save Changes is explicit human sign-off for parser-only
+      // ambiguity. Real content/media/answer errors cannot be waived.
+      if(hasManualReviewIssue(question))question.reviewConfirmed=true;
       reconcileManualParserIssues(question,changed);
     }
     if(rerender){
       refreshReviewAfterEdit(draft?"Draft saved. Review and select Save Changes when ready.":
         question.reviewConfirmed?"Answers confirmed. The question status and bank counts were updated.":
-          "Changes saved and validated. Confirm Answers if you have checked an outstanding review warning.",
+          "Changes saved and validated. Remaining source issues are shown if present.",
         draft?"review":question.reviewConfirmed?"good":"review");
     }
   };
@@ -2421,6 +3025,18 @@ function renderEditor() {
   if(addPair)addPair.onclick=()=>{readForm();question.pairs.push({left:"",right:""});renderEditor();};
   dom.editorPanel.querySelectorAll("[data-delete-pair]").forEach(btn=>btn.onclick=()=>{
     readForm();question.pairs.splice(Number(btn.dataset.deletePair),1);renderEditor();
+  });
+  dom.editorPanel.querySelectorAll("[data-add-dropdown-option]").forEach(btn=>btn.onclick=()=>{
+    readForm();const blank=question.blanks[Number(btn.dataset.addDropdownOption)];
+    if(blank){blank.options.push({text:"",correct:false});renderEditor();}
+  });
+  dom.editorPanel.querySelectorAll("[data-delete-dropdown-option]").forEach(btn=>btn.onclick=()=>{
+    readForm();const blank=question.blanks[Number(btn.dataset.deleteDropdownOption)];
+    const index=Number(btn.dataset.optionIndex);
+    if(blank?.options[index]){
+      if(blank.options[index].correct && !window.confirm("Delete the correct option? This dropdown will require a new correct answer."))return;
+      blank.options.splice(index,1);renderEditor();
+    }
   });
   const addBlank=document.getElementById("addBlankBtn");
   if(addBlank)addBlank.onclick=()=>{
@@ -2451,7 +3067,9 @@ function renderEditor() {
           question.blanks=[{id:"blank1",prompt:"Option 1",options:[]}];question.stem+="<p>[blank1]</p>";
         }
       } else question.draft=!!data.draft;
-      question.parseIssues=[];
+      // Converting type must not erase verified source-structure failures.
+      question.parseIssues=(question.parseIssues||[]).filter(issue=>
+        ["merged_answer_blocks","source_answer_options_missing","unresolved_auto_list_answer"].includes(issue.code));
       state.validation=null;revalidateAll();renderAll();
       setStatus(blank?"Blank template created. Complete and save the draft.":
         question.draft?"Type converted, but answer mapping requires manual completion before export.":
@@ -2465,17 +3083,20 @@ function renderEditor() {
   };
 }
 
-function nextVisibleQuestion(){
-  const eligible=visibleGroups().flatMap(g=>g.questions.filter(q=>matchesFilters(g,q)));
+function adjacentVisibleQuestion(direction){
+  const eligible=visibleGroups().flatMap(g=>visibleQuestionItems(g));
   const index=eligible.findIndex(q=>q.id===state.selectedQuestionId);
-  return index>=0?eligible[index+1]||null:null;
+  return index>=0?eligible[index+direction]||null:null;
 }
+function nextVisibleQuestion(){return adjacentVisibleQuestion(1);}
+function previousVisibleQuestion(){return adjacentVisibleQuestion(-1);}
 function updateNextQuestionButton(){
   if(!dom.nextQuestionBtn)return;
   dom.nextQuestionBtn.disabled=!nextVisibleQuestion();
+  dom.previousQuestionBtn.disabled=!previousVisibleQuestion();
 }
-dom.nextQuestionBtn.addEventListener("click",()=>{
-  const target=nextVisibleQuestion();
+function navigateVisibleQuestion(direction){
+  const target=adjacentVisibleQuestion(direction);
   if(!target)return;
   if(!confirmLeaveUnsavedEditor())return;
   const group=state.groups.find(g=>g.id===target.groupId);
@@ -2489,7 +3110,9 @@ dom.nextQuestionBtn.addEventListener("click",()=>{
   });
   renderEditor();renderPreview();renderValidationPanel();updateNextQuestionButton();
   dom.questionList.querySelector(`[data-question-id="${CSS.escape(target.id)}"]`)?.scrollIntoView({block:"nearest",behavior:"smooth"});
-});
+}
+dom.nextQuestionBtn.addEventListener("click",()=>navigateVisibleQuestion(1));
+dom.previousQuestionBtn.addEventListener("click",()=>navigateVisibleQuestion(-1));
 dom.expandEditorBtn.addEventListener("click",()=>{
   state.editorExpanded=!state.editorExpanded;
   document.querySelector("#reviewView .inspector").classList.toggle("expanded",state.editorExpanded);
@@ -2500,6 +3123,153 @@ document.addEventListener("keydown",e=>{
   if(e.key==="Escape"&&state.editorExpanded)dom.expandEditorBtn.click();
 });
 function selectedBankForManage() {return state.groups.find(g=>g.id===state.selectedBankId)||state.groups[0];}
+// GROUP-069: group identities remain stable. Changing display order/number only
+// updates unit/lesson/group labels, never question IDs or answer data.
+function sameLessonGroups(group){return state.groups.filter(g=>
+  !isDiagnosticGroup(g)&&g.sourceName===group.sourceName&&g.unit===group.unit&&g.lesson===group.lesson);}
+function renumberLesson(unit,lesson,sourceName){
+  state.groups.filter(g=>!isDiagnosticGroup(g)&&g.sourceName===sourceName&&g.unit===unit&&g.lesson===lesson)
+    .forEach((g,i)=>g.number=i+1);
+}
+function reopenReviewAfterGroupChange(message){
+  state.validation=null;
+  revalidateAll();renderAll();setStatus(message,"good");
+}
+function openGroupEditor(mode,bankId=null,moveSelectionAfterCreate=false){
+  if(!confirmLeaveUnsavedEditor())return;
+  const group=state.groups.find(g=>g.id===bankId);
+  const reference=group||selectedBankForManage();
+  const dialog=document.getElementById("editGroupDialog");
+  const unit=document.getElementById("groupEditorUnit");
+  const lesson=document.getElementById("groupEditorLesson");
+  const number=document.getElementById("groupEditorNumber");
+  const title=document.getElementById("groupEditorName");
+  document.getElementById("groupEditorTitle").textContent=mode==="edit"?"Edit Group":"Create Group";
+  unit.value=group?.unit||reference?.unit||"U1";
+  lesson.value=group?.lesson||reference?.lesson||"L1";
+  number.value=group?.number||((reference?Math.max(0,...sameLessonGroups(reference).map(g=>g.number)):0)+1);
+  title.value=group?.title||"";
+  document.getElementById("groupEditorFeedback").value=group?.feedback||"";
+  // VALID-075: explicit sign-off for review-level bank notes. Critical
+  // (correction) bank errors are never listed here and cannot be waived.
+  const reviewRow=document.getElementById("groupEditorReviewRow");
+  const reviewBox=document.getElementById("groupEditorReviewed");
+  const reviewNotes=mode==="edit"&&group?(group.waivableIssues||[]):[];
+  reviewRow.hidden=!reviewNotes.length;
+  reviewBox.checked=reviewNotes.length>0 && reviewNotes.every(issue=>bankIssueReviewed(group,issue));
+  document.getElementById("groupEditorReviewNotes").innerHTML=reviewNotes.map(issue=>`<li>${esc(issue.text)}</li>`).join("");
+  dialog.showModal();title.focus();
+  document.getElementById("groupEditorCancel").onclick=()=>dialog.close();
+  document.getElementById("groupEditorSave").onclick=()=>{
+    const u=unit.value.trim().toUpperCase(),l=lesson.value.trim().toUpperCase();
+    const n=Number(number.value),name=title.value.trim();
+    if(!/^U\d+$/.test(u)||!/^L\d+$/.test(l)||!Number.isInteger(n)||n<1||!name){
+      window.alert("Enter a name, Unit (e.g. U1), Lesson (e.g. L3), and a positive group number.");return;
+    }
+    const edited=mode==="edit"&&group;
+    const sourceName=reference?.sourceName||"Manual bank";
+    const destination=state.groups.filter(g=>!isDiagnosticGroup(g)&&g!==group&&g.sourceName===sourceName&&g.unit===u&&g.lesson===l);
+    if(destination.some(g=>g.number===n) && edited && (group.unit!==u||group.lesson!==l||group.number!==n)){
+      if(!window.confirm("The destination group number exists. Move and renumber groups in that unit/lesson?"))return;
+    }
+    const priorUnit=group?.unit, priorLesson=group?.lesson, priorSource=group?.sourceName;
+    let saved=group;
+    if(edited){
+      const oldIndex=state.groups.indexOf(group);
+      state.groups.splice(oldIndex,1);
+      saved.title=name;saved.unit=u;saved.lesson=l;saved.feedback=safeFeedbackHtml(document.getElementById("groupEditorFeedback").value);
+      if(!reviewRow.hidden)saved.reviewedBankIssues=reviewBox.checked?reviewNotes.map(issue=>issue.text):[];
+      // Preserve group ID and all questions, and preserve source parse issues.
+    } else {
+      saved={id:`bank_manual_${++state.idSequence}_${Date.now()}`,sourceName:reference?.sourceName||"Manual bank",
+        title:name,unit:u,lesson:l,number:n,feedback:safeFeedbackHtml(document.getElementById("groupEditorFeedback").value),
+        questions:[],parseIssues:[],issues:[],status:"good",teacherNotes:[],requiresImage:false,imageUrl:"",forceDropdown:false};
+    }
+    const peers=state.groups.filter(g=>!isDiagnosticGroup(g)&&g.sourceName===sourceName&&g.unit===u&&g.lesson===l);
+    const offset=Math.max(0,Math.min(n-1,peers.length));
+    const insertBefore=peers[offset];
+    const index=insertBefore?state.groups.indexOf(insertBefore):(
+      peers.length?state.groups.indexOf(peers[peers.length-1])+1:state.groups.length);
+    state.groups.splice(index,0,saved);
+    renumberLesson(u,l,sourceName);
+    if(edited&&(priorUnit!==u||priorLesson!==l))renumberLesson(priorUnit,priorLesson,priorSource);
+    let movedCount=0;
+    if(!edited && moveSelectionAfterCreate && state.selectedForMove.size){
+      const moved=state.groups.flatMap(g=>g.questions).filter(q=>state.selectedForMove.has(q.id));
+      moved.forEach(q=>{
+        const from=state.groups.find(g=>g.id===q.groupId);
+        if(from)from.questions=from.questions.filter(item=>item.id!==q.id);
+        q.groupId=saved.id;
+      });
+      saved.questions.push(...moved);
+      movedCount=moved.length;
+      state.selectedForMove.clear();
+    }
+    state.selectedBankId=saved.id;state.selectedQuestionId=saved.questions[0]?.id||null;
+    state.filter="all";state.issueFilter="all";state.questionTypeFilter="all";
+    dialog.close();
+    reopenReviewAfterGroupChange(edited?"Group details updated and group order reconciled.":
+      movedCount?`New group created and ${movedCount} question(s) moved.`:"New group created. Add or move questions into it.");
+  };
+}
+function reorderGroup(id,direction){
+  if(!confirmLeaveUnsavedEditor())return;
+  const g=state.groups.find(x=>x.id===id);if(!g||isDiagnosticGroup(g))return;
+  const peers=sameLessonGroups(g),index=peers.indexOf(g),destination=peers[index+(direction==="up"?-1:1)];
+  if(!destination)return;
+  const i=state.groups.indexOf(g),j=state.groups.indexOf(destination);
+  [state.groups[i],state.groups[j]]=[state.groups[j],state.groups[i]];
+  renumberLesson(g.unit,g.lesson,g.sourceName);state.selectedBankId=g.id;
+  reopenReviewAfterGroupChange("Group order updated. The other groups in this lesson were renumbered.");
+}
+function deleteEmptyGroup(id){
+  const group=state.groups.find(g=>g.id===id);
+  if(!group || isDiagnosticGroup(group) || group.questions.length>0)return;
+  if(!confirmLeaveUnsavedEditor())return;
+  if(!window.confirm(`Delete empty Group ${group.number}: ${group.title}? This removes the bank from the QTI export and renumbers the other groups in its lesson.`))return;
+  state.groups=state.groups.filter(g=>g.id!==id);
+  renumberLesson(group.unit,group.lesson,group.sourceName);
+  if(state.selectedBankId===id){
+    const next=state.groups.find(g=>!isDiagnosticGroup(g));
+    state.selectedBankId=next?.id||null;
+    state.selectedQuestionId=next?.questions[0]?.id||null;
+  }
+  reopenReviewAfterGroupChange("Empty group deleted. Remaining groups have been renumbered.");
+}
+function openQuestionMoveDialog(){
+  const moving=[...state.selectedForMove].map(id=>byId(id)).filter(Boolean);
+  if(!moving.length){window.alert("Select at least one question to move.");return;}
+  if(!confirmLeaveUnsavedEditor())return;
+  const select=document.getElementById("moveQuestionsTarget");
+  const origin=state.groups.find(g=>g.id===moving[0].groupId);
+  select.innerHTML=state.groups.filter(g=>!isDiagnosticGroup(g)).map(g=>
+    `<option value="${esc(g.id)}" ${g.id===origin?.id?"selected":""}>${esc(`${g.unit} – ${g.lesson} – Group ${g.number}: ${g.title}`)}</option>`).join("");
+  document.getElementById("moveQuestionsCount").textContent=`Moving ${moving.length} question(s). Answers, points, internal notes, and question-level feedback are preserved. Group feedback belongs to the destination bank.`;
+  const dialog=document.getElementById("moveQuestionsDialog");dialog.showModal();
+  document.getElementById("moveQuestionsCancel").onclick=()=>dialog.close();
+  document.getElementById("moveQuestionsCreate").onclick=()=>{dialog.close();openGroupEditor("create",null,true);};
+  document.getElementById("moveQuestionsApply").onclick=()=>{
+    const target=state.groups.find(g=>g.id===select.value);if(!target)return;
+    const position=document.getElementById("moveQuestionsPosition").value;
+    // Keep source order even for a selection spanning several banks.
+    const ordered=state.groups.flatMap(g=>g.questions).filter(q=>moving.includes(q));
+    for(const q of ordered){
+      const from=state.groups.find(g=>g.id===q.groupId);
+      from.questions=from.questions.filter(x=>x!==q);
+      q.groupId=target.id;
+    }
+    if(position==="start")target.questions.unshift(...ordered);else target.questions.push(...ordered);
+    state.selectedForMove.clear();state.selectedBankId=target.id;
+    state.selectedQuestionId=ordered[0]?.id||null;
+    // Preserve the question's individual feedback. Group feedback is inherited
+    // from target; no old group feedback is copied into the question.
+    state.filter="all";state.issueFilter="all";state.questionTypeFilter="all";
+    dialog.close();
+    reopenReviewAfterGroupChange(`${ordered.length} question(s) moved to ${target.title}.`);
+  };
+}
+document.getElementById("createGroupBtn").addEventListener("click",()=>openGroupEditor("create"));
+document.getElementById("moveSelectedBtn").addEventListener("click",openQuestionMoveDialog);
 function newQuestionForBank(group,type="multiple_choice_question") {
   const blank=blankQuestionData(type);
   const created={id:`q_manual_${++state.idSequence}_${Date.now()}`,groupId:group.id,stem:"",...blank,
@@ -2526,6 +3296,7 @@ function duplicateQuestion(id){
   const copy=JSON.parse(JSON.stringify(question));
   copy.id=`q_copy_${++state.idSequence}_${Date.now()}`;copy.customTitle=false;copy.draft=true;
   copy.parseIssues=[];copy.history=[];
+  delete copy.originBankId; // A copy is a manual addition, not a second source question.
   copy.originalSnapshot=snapshotForUndo(copy);
   group.questions.splice(index+1,0,copy);prepareQuestionSelection(group,copy.id);
 }
@@ -2542,6 +3313,9 @@ function removeQuestion(id){
   const question=byId(id);if(!question||!window.confirm(`Delete ${question.itemTitle}? This cannot be undone.`))return;
   const group=state.groups.find(g=>g.id===question.groupId);
   group.questions=group.questions.filter(q=>q.id!==id);
+  // An explicit Delete is a known author action, not a DOCX parser omission.
+  const owner=state.groups.find(g=>g.id===question.originBankId);
+  if(owner)owner.manuallyDeletedSourceCount=(owner.manuallyDeletedSourceCount||0)+1;
   state.selectedQuestionId=group.questions[0]?.id||null;
   state.validation=null;revalidateAll();renderAll();
 }
@@ -2602,13 +3376,65 @@ function renderPreview() {
   `;
 }
 
+// VALID-071: expected versus imported question counts for the JSON report.
+function bankQuestionCountReport(group){
+  const configured=Number(dom.questionsPerSet.value||0)||null;
+  const expected=configured ?? group.expectedQuestionCount ?? null;
+  const imported=group.questions.length;
+  const ownership=qtiLiveQuestionCounts(group);
+  const movedOut=state.groups.flatMap(g=>g.questions).filter(q=>q.originBankId===group.id && q.groupId!==group.id).length;
+  const movedIn=group.questions.filter(q=>q.originBankId && q.originBankId!==group.id).length;
+  const effectiveExpected=expected==null?null:expected-movedOut+movedIn+ownership.addedHere-ownership.deletedFromSource;
+  return {
+    imported,
+    expected,
+    difference: expected==null?null:ownership.fromSource+ownership.deletedFromSource-expected,
+    current_expected_after_moves:effectiveExpected,
+    current_difference:effectiveExpected==null?null:imported-effectiveExpected,
+    moved_out:movedOut,
+    moved_in:movedIn,
+    added_manually:ownership.addedHere,
+    deleted_from_source:ownership.deletedFromSource,
+    basis: configured?"Configured rule: Questions per group.":
+      (group.expectedQuestionBasis||"No source evidence (bank created manually)."),
+    source_answer_blocks: group.sourceAnswerBlockCount ?? null,
+    source_numbered_choice_questions: group.independentMcQuestionCount ?? null,
+    parser_numbered_openings: group.sourceNumberedQuestionCount ?? null,
+    imported_from_this_source_bank: isDiagnosticGroup(group)?0:qtiLiveQuestionCounts(group).fromSource
+  };
+}
+function reconciliationLevel(keyOf,withGroupNumbers){
+  return state.groups.filter(g=>!isDiagnosticGroup(g)).reduce((out,g)=>{
+    const key=keyOf(g);
+    let entry=out.find(e=>e.key===key);
+    if(!entry){
+      entry={key,banks:0,questions:0};
+      if(withGroupNumbers)entry.group_numbers=[];
+      Object.assign(entry,{expected_questions:0,banks_with_expected_count:0,banks_without_expected_count:0,mismatched_banks:[]});
+      out.push(entry);
+    }
+    const count=bankQuestionCountReport(g);
+    entry.banks++;entry.questions+=g.questions.length;
+    if(withGroupNumbers)entry.group_numbers.push(g.number);
+    if(count.expected==null)entry.banks_without_expected_count++;
+    else{
+      entry.banks_with_expected_count++;entry.expected_questions+=count.expected;
+      if(count.difference!==0)entry.mismatched_banks.push({
+        bank:`${g.unit} – ${g.lesson} – Group ${g.number}: ${g.title}`,
+        expected:count.expected,source_accounted:count.imported_from_this_source_bank+count.deleted_from_source,
+        imported:count.imported,source_difference:count.difference});
+    }
+    return out;
+  },[]);
+}
 function runValidation() {
   revalidateAll();
   const questions = state.groups.flatMap(group => group.questions);
   const report = {
     generated_at: new Date().toISOString(),
     totals: {
-      banks: state.groups.length,
+      banks: state.groups.filter(g=>!isDiagnosticGroup(g)).length,
+      diagnostic_banks: state.groups.filter(isDiagnosticGroup).length,
       questions: questions.length,
       good: questions.filter(q => q.status === "good").length,
       review: questions.filter(q => q.status === "review").length,
@@ -2623,14 +3449,22 @@ function runValidation() {
       shuffle_answers: dom.shuffleAnswers.checked,
       output_mode: dom.outputMode.value
     },
+    // VALID-071: the lesson-level entries keep their v3.16 fields and gain the
+    // expected counts; unit and document levels are added alongside.
+    reconciliation: reconciliationLevel(g=>`${g.sourceName} / ${g.unit} / ${g.lesson}`,true),
+    reconciliation_by_unit: reconciliationLevel(g=>`${g.sourceName} / ${g.unit}`,false),
+    reconciliation_by_document: reconciliationLevel(g=>g.sourceName,false),
     banks: state.groups.map(group => ({
       name: `${group.unit} – ${group.lesson} – Group ${group.number}: ${group.title}`,
+      diagnostic: isDiagnosticGroup(group),
       source_name: group.sourceName,
+      question_count: bankQuestionCountReport(group),
+      reviewed_bank_notes: group.reviewedBankIssues || [],
       source_points_per_question: group.sourcePointsPerQuestion ?? null,
       status: group.status,
       issues: group.issues.map(issue => issue.text),
       requires_image: !!group.requiresImage || group.questions.some(q=>unresolvedQuestionImageReference(q,group)),
-      image_placeholder_pending: !!group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || ""),
+      image_placeholder_pending: !!group.requiresImage && !canonicalCdnImageUrl(group.imageUrl || "") && !group.questions.every(q=>hasQuestionImage(q)),
       internal_notes: group.teacherNotes || [],
       questions: group.questions.map(question => ({
         item_title: question.itemTitle,
@@ -2662,9 +3496,10 @@ function runValidation() {
   state.validation = report;
   renderValidationPanel();
   if (state.activeView === "review") switchTab("validation");
-  const totalCorrections = report.totals.correction;
-  const type = totalCorrections ? "correction" : report.totals.review ? "review" : "good";
-  setStatus(`Validation complete. ${report.totals.good} good, ${report.totals.review} review, ${report.totals.correction} correction.`, type);
+  const bankCorrections=state.groups.filter(g=>g.status==="correction").length;
+  const bankReviews=state.groups.filter(g=>g.status==="review").length;
+  const type = report.totals.correction||bankCorrections ? "correction" : report.totals.review||bankReviews ? "review" : "good";
+  setStatus(`Validation complete. ${report.totals.good} good, ${report.totals.review} review, ${report.totals.correction} correction question(s); ${bankReviews} bank(s) need review and ${bankCorrections} bank(s) need correction.`, type);
   renderAll();
 }
 
@@ -2961,7 +3796,7 @@ async function buildCombinedZip() {
 
 async function buildIndividualBundle() {
   const bundle = new JSZip();
-  bundle.file("READ_ME_FIRST.txt", "Canvas QTI Studio v3.13: This bundle is an archive of individual bank QTI ZIP files.\n" +
+  bundle.file("READ_ME_FIRST.txt", "Canvas QTI Studio v3.17 Final: This bundle is an archive of individual bank QTI ZIP files.\n" +
     "DO NOT upload this outer bundle to Canvas. Extract it, then import each inner ZIP via Settings > Import Course Content > QTI .zip file.\n" +
     "For a single QTI package upload, use the Combined QTI ZIP export mode instead.\n" +
     "Verify bank creation and question accuracy in a test Canvas course before production.\n");

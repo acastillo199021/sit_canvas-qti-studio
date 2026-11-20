@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Canvas QTI Studio v3.14</title>
+  <title>Canvas QTI Studio v3.17 Final</title>
   <link rel="stylesheet" href="styles.css">
   <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
@@ -13,7 +13,7 @@
   <header class="hero">
     <div class="hero-inner">
       <div class="eyebrow">Canvas Classic Quizzes · QTI 1.2</div>
-      <div class="hero-title-row"><h1>Canvas QTI Studio</h1><span class="version-tag">v3.14</span></div>
+      <div class="hero-title-row"><h1>Canvas QTI Studio</h1><span class="version-tag">v3.17 Final</span></div>
       <p class="hero-copy">Convert Word assessments to Canvas question banks — configure, validate, then review the questions that matter.</p>
     </div>
   </header>
@@ -86,6 +86,8 @@
         </div>
         <div class="review-filters">
           <label class="field search-field"><span>Search question or bank</span><input id="searchBox" type="search" placeholder="Search title, text, answer, or group..."></label>
+          <label class="field"><span>Unit</span><select id="unitFilter"><option value="all">All units</option></select></label>
+          <label class="field"><span>Lesson</span><select id="lessonFilter"><option value="all">All lessons</option></select></label>
           <label class="field"><span>Question type</span><select id="questionTypeFilter">
             <option value="all">All question types</option>
             <option value="multiple_choice">Multiple Choice</option>
@@ -113,17 +115,18 @@
           <div class="issue-filter-heading"><span class="issue-filter-caption">Quick issue filters</span><button type="button" class="issue-clear-filters" aria-label="Clear all question filters">Clear Filters</button></div>
           <div id="bankIssueFilters" class="issue-filter-bar" aria-label="Filter question banks by issue"></div>
           <label class="issue-feedback-label">Feedback <select class="feedback-filter" aria-label="Filter by feedback"><option value="all">All feedback</option><option value="no_feedback">No Feedback (optional)</option></select></label>
+          <button id="createGroupBtn" class="btn btn-secondary btn-small bank-create-btn" type="button">+ Create Group</button>
           <div id="bankList" class="bank-list empty-state">No banks analyzed yet.</div>
         </aside>
         <section class="card center-panel">
-          <div class="card-head"><div><div class="section-kicker">STEP 3</div><h2>Questions</h2><p class="question-selection-hint">Select, add, duplicate, or reorder questions.</p></div><div class="question-head-actions"><span id="currentFilterLabel" class="pill neutral">All</span><button id="addQuestionBtn" type="button" class="btn btn-primary btn-small">+ Add question</button></div></div>
+          <div class="card-head"><div><div class="section-kicker">STEP 3</div><h2>Questions</h2><p class="question-selection-hint">Select, add, duplicate, or reorder questions.</p></div><div class="question-head-actions"><span id="currentFilterLabel" class="pill neutral">All</span><button id="moveSelectedBtn" type="button" class="btn btn-secondary btn-small">Move Selected</button><button id="addQuestionBtn" type="button" class="btn btn-primary btn-small">+ Add question</button></div></div>
           <div class="issue-filter-heading"><span class="issue-filter-caption">Quick issue filters</span><button type="button" class="issue-clear-filters" aria-label="Clear all question filters">Clear Filters</button></div>
           <div id="questionIssueFilters" class="issue-filter-bar" aria-label="Filter questions by issue"></div>
           <label class="issue-feedback-label">Feedback <select class="feedback-filter" aria-label="Filter by feedback"><option value="all">All feedback</option><option value="no_feedback">No Feedback (optional)</option></select></label>
           <div id="questionList" class="question-list empty-state">Analyze your Word file to review questions.</div>
         </section>
         <section class="card inspector">
-          <div class="card-head"><div><div class="section-kicker">STEP 4</div><h2>Editor &amp; preview</h2></div><div class="inspector-head-actions"><button id="expandEditorBtn" type="button" class="btn btn-quiet btn-small" aria-pressed="false">Expand editor</button><button id="nextQuestionBtn" type="button" class="btn btn-secondary btn-small" disabled>Next →</button></div></div>
+          <div class="card-head"><div><div class="section-kicker">STEP 4</div><h2>Editor &amp; preview</h2></div><div class="inspector-head-actions"><button id="expandEditorBtn" type="button" class="btn btn-quiet btn-small" aria-pressed="false">Expand editor</button><div class="question-nav-buttons"><button id="previousQuestionBtn" type="button" class="btn btn-secondary btn-small" disabled>← Previous</button><button id="nextQuestionBtn" type="button" class="btn btn-secondary btn-small" disabled>Next →</button></div></div></div>
           <div class="inspector-tabs" role="tablist" aria-label="Question tools">
             <button class="tab active" type="button" data-tab="editor">Editor</button>
             <button class="tab" type="button" data-tab="preview">Preview</button>
@@ -137,6 +140,38 @@
         </section>
       </div>
     </section>
+    <dialog id="editGroupDialog" class="qti-image-dialog" aria-labelledby="groupEditorTitle">
+      <h3 id="groupEditorTitle">Edit Group</h3>
+      <p class="validation-help">Update the group name, Unit, Lesson and position without changing question content.</p>
+      <label class="field"><span>Group Name</span><input id="groupEditorName" type="text" required></label>
+      <div class="group-editor-grid">
+        <label class="field"><span>Unit</span><input id="groupEditorUnit" type="text" placeholder="U1"></label>
+        <label class="field"><span>Lesson</span><input id="groupEditorLesson" type="text" placeholder="L3"></label>
+        <label class="field"><span>Group Number / Position</span><input id="groupEditorNumber" type="number" min="1" step="1"></label>
+      </div>
+      <label class="field"><span>Group Feedback</span><textarea id="groupEditorFeedback" rows="3"></textarea></label>
+      <div id="groupEditorReviewRow" class="group-review-signoff" hidden>
+        <strong>Bank review notes</strong>
+        <ul id="groupEditorReviewNotes"></ul>
+        <label class="toggle"><input id="groupEditorReviewed" type="checkbox"><span>Mark these notes as reviewed</span></label>
+        <p class="validation-help">Only review notes can be marked as reviewed. Errors that need correction stay until they are fixed.</p>
+      </div>
+      <div class="action-list"><button id="groupEditorCancel" type="button" class="btn btn-secondary">Cancel</button><button id="groupEditorSave" type="button" class="btn btn-primary">Save Group</button></div>
+    </dialog>
+    <dialog id="moveQuestionsDialog" class="qti-image-dialog" aria-labelledby="moveQuestionsTitle">
+      <h3 id="moveQuestionsTitle">Move to Group</h3>
+      <p id="moveQuestionsCount" class="validation-help"></p>
+      <label class="field"><span>Destination Group</span><select id="moveQuestionsTarget"></select></label>
+      <label class="field"><span>Insert at</span><select id="moveQuestionsPosition"><option value="end">End of group</option><option value="start">Beginning of group</option></select></label>
+      <div class="action-list"><button id="moveQuestionsCreate" type="button" class="btn btn-secondary">Create Group</button><button id="moveQuestionsCancel" type="button" class="btn btn-secondary">Cancel</button><button id="moveQuestionsApply" type="button" class="btn btn-primary">Move Questions</button></div>
+    </dialog>
+    <dialog id="insertImageDialog" class="qti-image-dialog" aria-labelledby="imageDialogTitle">
+      <h3 id="imageDialogTitle">Insert Image</h3>
+      <p class="validation-help">The image is embedded into Stem HTML and the exported QTI. Use an accessible HTTPS image URL.</p>
+      <label class="field"><span>Image URL (HTTPS)</span><input id="insertImageUrl" type="url" placeholder="https://cdn-media.example.edu/image.png" required /></label>
+      <label class="field"><span>Alternative text (leave blank for a decorative image)</span><input id="insertImageAlt" type="text" placeholder="Description of the image" /></label>
+      <div class="action-list"><button id="insertImageCancel" type="button" class="btn btn-secondary">Cancel</button><button id="insertImageConfirm" type="button" class="btn btn-primary">Insert Image</button></div>
+    </dialog>
     <footer class="app-footer">Your Word files are processed locally in the browser. Mammoth and JSZip are loaded from CDN and require an internet connection.</footer>
   </main>
 </body>
